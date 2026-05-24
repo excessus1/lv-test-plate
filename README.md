@@ -188,18 +188,20 @@ const char MQTT_CLIENT_ID[] = "lv-test-plate-uno-r4";
 Default pins are at the top of `firmware/lv-test-plate/lv-test-plate.ino`:
 
 ```cpp
-const int RELAY_1_PIN = 2;  // D2
-const int RELAY_2_PIN = 3;  // D3
-const int SSR_1_PIN = 4;    // D4
+const int RELAY_1_PIN = 12; // D12
+const int RELAY_2_PIN = 13; // D13
+const int SSR_1_PIN = 3;    // D3
 const int PWM_PIN = 5;      // D5
 const int POT_PIN = A0;     // A0
 ```
 
-If a relay or SSR board is active-low, change:
+Relay module and SSR polarity are configured separately. If either device is active-low, change only that device's pair:
 
 ```cpp
-const int OUTPUT_ON_LEVEL = HIGH;
-const int OUTPUT_OFF_LEVEL = LOW;
+const int RELAY_ON_LEVEL = HIGH;
+const int RELAY_OFF_LEVEL = LOW;
+const int SSR_ON_LEVEL = HIGH;
+const int SSR_OFF_LEVEL = LOW;
 ```
 
 ## Compile Firmware

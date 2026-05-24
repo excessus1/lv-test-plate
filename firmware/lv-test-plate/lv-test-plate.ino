@@ -10,15 +10,17 @@
 #endif
 
 // Pin mapping. Edit these constants to match the test plate wiring.
-const int RELAY_1_PIN = 12;       // D2, digital relay output
-const int RELAY_2_PIN = 13;       // D3, digital relay output
-const int SSR_1_PIN = 3;         // D4, SSR output
+const int RELAY_1_PIN = 12;      // D12, digital relay output
+const int RELAY_2_PIN = 13;      // D13, digital relay output
+const int SSR_1_PIN = 3;         // D3, SSR output
 const int PWM_PIN = 5;           // D5, PWM-capable output
 const int POT_PIN = A0;          // A0, analog potentiometer input
 
-// Change these if your relay/SSR board is active-low.
-const int OUTPUT_ON_LEVEL = HIGH;
-const int OUTPUT_OFF_LEVEL = LOW;
+// Output polarity. Relay modules and SSRs often use different active levels.
+const int RELAY_ON_LEVEL = LOW;
+const int RELAY_OFF_LEVEL = HIGH;
+const int SSR_ON_LEVEL = HIGH;
+const int SSR_OFF_LEVEL = LOW;
 
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long STATE_PUBLISH_INTERVAL_MS = 5000;
@@ -48,9 +50,9 @@ unsigned long lastTelemetryPublish = 0;
 bool mqttWasConnected = false;
 
 void applyOutputs() {
-  digitalWrite(RELAY_1_PIN, outputs.relay1 ? OUTPUT_ON_LEVEL : OUTPUT_OFF_LEVEL);
-  digitalWrite(RELAY_2_PIN, outputs.relay2 ? OUTPUT_ON_LEVEL : OUTPUT_OFF_LEVEL);
-  digitalWrite(SSR_1_PIN, outputs.ssr1 ? OUTPUT_ON_LEVEL : OUTPUT_OFF_LEVEL);
+  digitalWrite(RELAY_1_PIN, outputs.relay1 ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
+  digitalWrite(RELAY_2_PIN, outputs.relay2 ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
+  digitalWrite(SSR_1_PIN, outputs.ssr1 ? SSR_ON_LEVEL : SSR_OFF_LEVEL);
   analogWrite(PWM_PIN, outputs.pwmEnabled ? constrain(outputs.pwmValue, 0, 255) : 0);
 }
 
