@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+firmware/lv-test-plate/config.h
+
+.arduino/
+build/
+dist/
+
+bin/

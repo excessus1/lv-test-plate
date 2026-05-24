@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lv-test-plate</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Low-voltage test plate</p>
+          <h1>lv-test-plate</h1>
+        </div>
+        <div class="status-cluster">
+          <span id="app-mqtt" class="pill pill-warn">MQTT: unknown</span>
+          <span id="board-status" class="pill pill-warn">Board: unknown</span>
+        </div>
+      </header>
+
+      <section class="safety-band">
+        <button id="all-off" class="danger-button" type="button">All Outputs Off</button>
+      </section>
+
+      <section class="grid">
+        <article class="panel controls-panel">
+          <h2>Manual Controls</h2>
+          <div class="control-list">
+            <button class="toggle" data-output="relay_1" type="button">
+              <span>Relay 1</span>
+              <strong>OFF</strong>
+            </button>
+            <button class="toggle" data-output="relay_2" type="button">
+              <span>Relay 2</span>
+              <strong>OFF</strong>
+            </button>
+            <button class="toggle" data-output="ssr_1" type="button">
+              <span>SSR 1</span>
+              <strong>OFF</strong>
+            </button>
+          </div>
+
+          <div class="pwm-block">
+            <button class="toggle" data-output="pwm_enabled" type="button">
+              <span>PWM Output</span>
+              <strong>OFF</strong>
+            </button>
+            <label class="slider-label" for="pwm-value">
+              <span>PWM Value</span>
+              <output id="pwm-output">0</output>
+            </label>
+            <input id="pwm-value" type="range" min="0" max="255" step="1" value="0" />
+          </div>
+        </article>
+
+        <article class="panel">
+          <h2>Telemetry</h2>
+          <dl class="telemetry">
+            <div>
+              <dt>Uptime</dt>
+              <dd id="uptime">-</dd>
+            </div>
+            <div>
+              <dt>WiFi RSSI</dt>
+              <dd id="wifi-rssi">-</dd>
+            </div>
+            <div>
+              <dt>Potentiometer</dt>
+              <dd id="pot-value">-</dd>
+            </div>
+            <div>
+              <dt>Last command</dt>
+              <dd id="last-command">-</dd>
+            </div>
+          </dl>
+        </article>
+      </section>
+
+      <section class="panel details-panel">
+        <h2>Current Outputs</h2>
+        <div class="output-strip">
+          <span id="out-relay-1">relay_1: off</span>
+          <span id="out-relay-2">relay_2: off</span>
+          <span id="out-ssr-1">ssr_1: off</span>
+          <span id="out-pwm">pwm: off / 0</span>
+        </div>
+        <p id="message" class="message">Waiting for MQTT connection.</p>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+
