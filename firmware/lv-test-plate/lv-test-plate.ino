@@ -43,7 +43,7 @@ struct Outputs {
 };
 
 Outputs outputs;
-String lastCommand = "";
+String lastCommandSummary = "";
 unsigned long lastMqttAttempt = 0;
 unsigned long lastStatePublish = 0;
 unsigned long lastTelemetryPublish = 0;
@@ -72,7 +72,7 @@ void publishText(const String& topic, const char* text, bool retained) {
 }
 
 void publishState(bool retained) {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<384> doc;
   JsonObject out = doc.createNestedObject("outputs");
   out["relay_1"] = outputs.relay1;
   out["relay_2"] = outputs.relay2;
@@ -80,11 +80,7 @@ void publishState(bool retained) {
   out["pwm_enabled"] = outputs.pwmEnabled;
   out["pwm_value"] = outputs.pwmValue;
   doc["uptime_ms"] = millis();
-  String stateLastCommand = lastCommand;
-  if (stateLastCommand.length() > 320) {
-    stateLastCommand = stateLastCommand.substring(0, 320);
-  }
-  doc["last_command"] = stateLastCommand;
+  doc["last_command"] = lastCommandSummary;
 
   String payload;
   serializeJson(doc, payload);
@@ -108,6 +104,35 @@ void publishTelemetry() {
   mqttClient.endMessage();
 }
 
+void updateLastCommandSummary(const JsonObject& out) {
+  String summary = "";
+  if (out.containsKey("relay_1")) {
+    summary += "relay_1:";
+    summary += outputs.relay1 ? "on" : "off";
+  }
+  if (out.containsKey("relay_2")) {
+    if (summary.length() > 0) summary += " ";
+    summary += "relay_2:";
+    summary += outputs.relay2 ? "on" : "off";
+  }
+  if (out.containsKey("ssr_1")) {
+    if (summary.length() > 0) summary += " ";
+    summary += "ssr_1:";
+    summary += outputs.ssr1 ? "on" : "off";
+  }
+  if (out.containsKey("pwm_enabled")) {
+    if (summary.length() > 0) summary += " ";
+    summary += "pwm_enabled:";
+    summary += outputs.pwmEnabled ? "on" : "off";
+  }
+  if (out.containsKey("pwm_value")) {
+    if (summary.length() > 0) summary += " ";
+    summary += "pwm:";
+    summary += outputs.pwmValue;
+  }
+  lastCommandSummary = summary.length() > 0 ? summary : "outputs";
+}
+
 void handleCommand(int messageSize) {
   String payload;
   while (mqttClient.available()) {
@@ -117,7 +142,7 @@ void handleCommand(int messageSize) {
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
-    lastCommand = "invalid_json";
+    lastCommandSummary = "invalid_json";
     publishState(true);
     return;
   }
@@ -129,9 +154,11 @@ void handleCommand(int messageSize) {
     if (out.containsKey("ssr_1")) outputs.ssr1 = out["ssr_1"].as<bool>();
     if (out.containsKey("pwm_enabled")) outputs.pwmEnabled = out["pwm_enabled"].as<bool>();
     if (out.containsKey("pwm_value")) outputs.pwmValue = constrain(out["pwm_value"].as<int>(), 0, 255);
+    updateLastCommandSummary(out);
+  } else {
+    lastCommandSummary = "no_outputs";
   }
 
-  lastCommand = payload;
   applyOutputs();
   publishState(true);
 }

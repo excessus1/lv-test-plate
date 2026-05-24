@@ -226,7 +226,7 @@ def _recover_state_payload(text: str) -> dict[str, Any] | None:
     try:
         recovered["last_command"] = _decode_json_value_after_key(text, "last_command")
     except (json.JSONDecodeError, ValueError):
-        recovered["last_command"] = "unparseable_state_payload"
+        recovered["last_command"] = None
     return recovered
 
 
