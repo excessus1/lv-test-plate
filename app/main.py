@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,8 +14,8 @@ from threading import Lock
 from typing import Any
 
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -21,6 +23,7 @@ logger = logging.getLogger("lv-test-plate")
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+ASSET_VERSION = os.getenv("ASSET_VERSION", str(int(time.time())))
 
 
 @dataclass(frozen=True)
@@ -92,14 +95,26 @@ class DashboardState:
             },
         }
 
+    def _snapshot_locked(self) -> dict[str, Any]:
+        snapshot = json.loads(json.dumps(self._state))
+        snapshot["server_time"] = time.time()
+        return snapshot
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps(self._state))
+            return self._snapshot_locked()
 
     def update_app(self, **values: Any) -> dict[str, Any]:
         with self._lock:
             self._state["app"].update(values)
-            return json.loads(json.dumps(self._state))
+            return self._snapshot_locked()
+
+    def apply_outputs(self, outputs: dict[str, Any], last_command: Any | None = None) -> dict[str, Any]:
+        with self._lock:
+            self._state["outputs"].update(_coerce_outputs(outputs))
+            if last_command is not None:
+                self._state["last_command"] = last_command
+            return self._snapshot_locked()
 
     def apply_mqtt_message(self, topic_key: str, payload: Any) -> dict[str, Any]:
         now = time.time()
@@ -134,7 +149,7 @@ class DashboardState:
                         "last_received_at": now,
                     }
                 )
-            return json.loads(json.dumps(self._state))
+            return self._snapshot_locked()
 
 
 class WebSocketHub:
@@ -184,6 +199,37 @@ def _parse_payload(payload: bytes) -> Any:
         return text
 
 
+def _decode_json_value_after_key(text: str, key: str) -> Any:
+    marker = f'"{key}"'
+    marker_index = text.find(marker)
+    if marker_index < 0:
+        raise ValueError(f"Missing {key}")
+    colon_index = text.find(":", marker_index + len(marker))
+    if colon_index < 0:
+        raise ValueError(f"Missing colon after {key}")
+    value_text = text[colon_index + 1 :].lstrip()
+    value, _end = json.JSONDecoder().raw_decode(value_text)
+    return value
+
+
+def _recover_state_payload(text: str) -> dict[str, Any] | None:
+    try:
+        outputs = _decode_json_value_after_key(text, "outputs")
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    recovered: dict[str, Any] = {"outputs": outputs}
+    try:
+        recovered["uptime_ms"] = _decode_json_value_after_key(text, "uptime_ms")
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        recovered["last_command"] = _decode_json_value_after_key(text, "last_command")
+    except (json.JSONDecodeError, ValueError):
+        recovered["last_command"] = "unparseable_state_payload"
+    return recovered
+
+
 settings = Settings.from_env()
 state = DashboardState(settings)
 hub = WebSocketHub()
@@ -191,25 +237,44 @@ mqtt_client: mqtt.Client | None = None
 event_loop: asyncio.AbstractEventLoop | None = None
 
 
-def _schedule_broadcast(snapshot: dict[str, Any]) -> None:
+def _schedule_broadcast(
+    snapshot: dict[str, Any],
+    message_type: str = "snapshot",
+    **extra: Any,
+) -> None:
     if event_loop and event_loop.is_running():
-        asyncio.run_coroutine_threadsafe(hub.broadcast({"type": "snapshot", "data": snapshot}), event_loop)
+        message = {"type": message_type, "data": snapshot}
+        message.update(extra)
+        asyncio.run_coroutine_threadsafe(hub.broadcast(message), event_loop)
+
+
+def _mqtt_connected(reason_code: Any) -> bool:
+    is_failure = getattr(reason_code, "is_failure", None)
+    if is_failure is not None:
+        return not bool(is_failure)
+    try:
+        return int(reason_code) == 0
+    except (TypeError, ValueError):
+        return str(reason_code).lower() in {"0", "success", "normal disconnection"}
 
 
 def _make_mqtt_client() -> mqtt.Client:
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"lv-test-plate-web-{os.getpid()}")
+    client_id = f"lv-test-plate-web-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
     if settings.mqtt_username:
         client.username_pw_set(settings.mqtt_username, settings.mqtt_password or None)
 
     topic_lookup = {topic: key for key, topic in settings.topics.items()}
 
     def on_connect(client: mqtt.Client, _userdata: Any, _flags: mqtt.ConnectFlags, reason_code: mqtt.ReasonCode, _properties: mqtt.Properties | None) -> None:
-        connected = reason_code == 0
+        connected = _mqtt_connected(reason_code)
         logger.info("MQTT connect result: %s", reason_code)
         snapshot = state.update_app(mqtt_connected=connected, last_error=None if connected else str(reason_code))
         if connected:
             for topic_key in ("state", "telemetry", "status"):
-                client.subscribe(settings.topics[topic_key])
+                topic = settings.topics[topic_key]
+                client.subscribe(topic)
+                logger.info("Subscribed to MQTT topic %s", topic)
         _schedule_broadcast(snapshot)
 
     def on_disconnect(client: mqtt.Client, _userdata: Any, _disconnect_flags: mqtt.DisconnectFlags, reason_code: mqtt.ReasonCode, _properties: mqtt.Properties | None) -> None:
@@ -222,8 +287,19 @@ def _make_mqtt_client() -> mqtt.Client:
         if not topic_key:
             return
         payload = _parse_payload(message.payload)
+        if topic_key == "state" and isinstance(payload, str):
+            recovered_payload = _recover_state_payload(payload)
+            if recovered_payload is not None:
+                logger.debug("Recovered outputs from malformed MQTT state payload")
+                payload = recovered_payload
+        logger.info("MQTT %s payload received", topic_key)
         snapshot = state.apply_mqtt_message(topic_key, payload)
-        _schedule_broadcast(snapshot)
+        _schedule_broadcast(
+            snapshot,
+            message_type="mqtt_message",
+            topic_key=topic_key,
+            payload=payload,
+        )
 
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
@@ -253,9 +329,23 @@ app = FastAPI(title="lv-test-plate", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def add_development_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+async def index() -> HTMLResponse:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = html.replace("{{APP_JS_VERSION}}", ASSET_VERSION)
+    html = html.replace("{{STYLES_VERSION}}", ASSET_VERSION)
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -273,12 +363,23 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
     if mqtt_client is None or not mqtt_client.is_connected():
         raise HTTPException(status_code=503, detail="MQTT is not connected")
 
-    outputs = command.get("outputs")
-    if not isinstance(outputs, dict):
-        raise HTTPException(status_code=400, detail="Command must include an outputs object")
+    current_outputs = state.snapshot().get("outputs", {})
+    next_outputs = _coerce_outputs(current_outputs)
+
+    toggle_key = command.get("toggle")
+    if toggle_key is not None:
+        if toggle_key not in {"relay_1", "relay_2", "ssr_1", "pwm_enabled"}:
+            raise HTTPException(status_code=400, detail="Unsupported toggle output")
+        next_outputs[toggle_key] = not bool(next_outputs.get(toggle_key, False))
+    elif isinstance(command.get("set_outputs"), dict):
+        next_outputs.update(_coerce_outputs(command["set_outputs"]))
+    elif isinstance(command.get("outputs"), dict):
+        next_outputs.update(_coerce_outputs(command["outputs"]))
+    else:
+        raise HTTPException(status_code=400, detail="Command must include toggle, set_outputs, or outputs")
 
     payload = {
-        "outputs": _coerce_outputs(outputs),
+        "outputs": next_outputs,
         "source": "web",
         "ts": time.time(),
     }
@@ -286,8 +387,8 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
         raise HTTPException(status_code=503, detail=f"MQTT publish failed: {mqtt.error_string(info.rc)}")
 
-    snapshot = state.snapshot()
-    await hub.broadcast({"type": "command_sent", "data": payload})
+    snapshot = state.apply_outputs(next_outputs, last_command=payload)
+    await hub.broadcast({"type": "command_sent", "data": snapshot, "payload": payload})
     return {"ok": True, "topic": settings.topics["cmd"], "payload": payload, "snapshot": snapshot}
 
 

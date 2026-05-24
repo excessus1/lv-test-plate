@@ -259,6 +259,12 @@ dd {
   color: var(--muted);
 }
 
+.debug-line {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
 @media (max-width: 780px) {
   .shell {
     padding: 14px;
@@ -292,4 +298,3 @@ dd {
     grid-template-columns: 1fr;
   }
 }
-

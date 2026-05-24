@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>lv-test-plate</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v={{STYLES_VERSION}}" />
   </head>
   <body>
     <main class="shell">
@@ -86,10 +86,10 @@
           <span id="out-pwm">pwm: off / 0</span>
         </div>
         <p id="message" class="message">Waiting for MQTT connection.</p>
+        <p id="ws-debug" class="debug-line">WebSocket: waiting</p>
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v={{APP_JS_VERSION}}"></script>
   </body>
 </html>
-

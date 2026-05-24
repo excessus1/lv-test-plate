@@ -72,7 +72,7 @@ void publishText(const String& topic, const char* text, bool retained) {
 }
 
 void publishState(bool retained) {
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<1024> doc;
   JsonObject out = doc.createNestedObject("outputs");
   out["relay_1"] = outputs.relay1;
   out["relay_2"] = outputs.relay2;
@@ -80,7 +80,11 @@ void publishState(bool retained) {
   out["pwm_enabled"] = outputs.pwmEnabled;
   out["pwm_value"] = outputs.pwmValue;
   doc["uptime_ms"] = millis();
-  doc["last_command"] = lastCommand;
+  String stateLastCommand = lastCommand;
+  if (stateLastCommand.length() > 320) {
+    stateLastCommand = stateLastCommand.substring(0, 320);
+  }
+  doc["last_command"] = stateLastCommand;
 
   String payload;
   serializeJson(doc, payload);
