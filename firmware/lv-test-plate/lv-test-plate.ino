@@ -10,7 +10,7 @@
 #endif
 
 // Pin mapping. Edit these constants to match the test plate wiring.
-const int RELAY_1_PIN = 12;      // D12, digital relay output
+const int RELAY_1_PIN = 8;      // D8, digital relay output
 const int RELAY_2_PIN = 13;      // D13, digital relay output
 const int SSR_1_PIN = 3;         // D3, SSR output
 const int PWM_PIN = 5;           // D5, PWM-capable output
