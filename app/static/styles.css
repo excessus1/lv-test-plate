@@ -181,6 +181,111 @@ h2 {
   background: var(--good);
 }
 
+.switch-test-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.switch-test {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #111821;
+}
+
+.switch-test[open] {
+  background: var(--panel-strong);
+}
+
+.switch-test.is-pass {
+  border-color: var(--good);
+}
+
+.switch-test.is-fail {
+  border-color: var(--danger);
+}
+
+.switch-test summary {
+  min-height: 52px;
+  padding: 14px;
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.switch-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 0 14px 14px;
+}
+
+.switch-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.switch-grid input,
+.switch-grid select {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: var(--text);
+  background: #0f141b;
+}
+
+.switch-check {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  align-content: center;
+  min-height: 44px;
+}
+
+.switch-check input {
+  width: 22px;
+  min-height: 22px;
+  accent-color: var(--accent);
+}
+
+.switch-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 0 14px 14px;
+}
+
+.switch-status span {
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  color: var(--muted);
+  background: #0f141b;
+  overflow-wrap: anywhere;
+}
+
+.switch-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 0 14px 14px;
+}
+
+.switch-actions button {
+  min-height: 48px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: var(--text);
+  background: #102536;
+  cursor: pointer;
+  font-weight: 750;
+}
+
 .pwm-block {
   display: grid;
   gap: 12px;
@@ -291,10 +396,19 @@ dd {
   .output-strip {
     grid-template-columns: 1fr 1fr;
   }
+
+  .switch-status {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 440px) {
   .output-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .switch-grid,
+  .switch-actions {
     grid-template-columns: 1fr;
   }
 }

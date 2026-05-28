@@ -97,6 +97,18 @@ The dashboard provides large touch targets for:
 - PWM value `0` through `255`
 - prominent `All Outputs Off`
 
+Each relay also has an expandable switch-test section. Switch testing is optional per relay; channels with no switch input configured continue to work as normal relay outputs.
+
+Per-relay switch-test settings:
+
+- enabled/disabled
+- input pin selected from the firmware-published pin options
+- switch mode: `NO` or `NC`
+- pull mode: `pullup`, `pulldown`, or `external`
+- debounce time in milliseconds
+- settle delay in milliseconds
+- read-now and relay-plus-switch test actions
+
 It displays:
 
 - app MQTT connection status
@@ -106,6 +118,8 @@ It displays:
 - WiFi RSSI
 - analog potentiometer input
 - last command received by the board
+- current switch open/closed state and raw digital state for configured relay switch tests
+- last relay-plus-switch test result
 
 ## MQTT Payloads
 
@@ -125,6 +139,27 @@ Command messages published by the web app:
 }
 ```
 
+Switch-test configuration and actions are additive top-level command fields. Existing output-only commands remain valid.
+
+```json
+{
+  "switch_tests": {
+    "relay_1": {
+      "enabled": true,
+      "pin": 2,
+      "mode": "NO",
+      "pull_mode": "pullup",
+      "debounce_ms": 30,
+      "settle_ms": 150
+    }
+  },
+  "read_switch": "relay_1",
+  "test_switch": "relay_1",
+  "source": "web",
+  "ts": 1716500000.0
+}
+```
+
 Board state messages:
 
 ```json
@@ -136,6 +171,41 @@ Board state messages:
     "pwm_enabled": true,
     "pwm_value": 128
   },
+  "switch_tests": {
+    "relay_1": {
+      "enabled": true,
+      "pin": 2,
+      "pin_label": "D2",
+      "mode": "NO",
+      "pull_mode": "pullup",
+      "effective_pull_mode": "pullup",
+      "debounce_ms": 30,
+      "settle_ms": 150,
+      "configured": true,
+      "current": {
+        "configured": true,
+        "raw": 1,
+        "raw_state": "HIGH",
+        "closed": false,
+        "state": "open",
+        "bounce_count": 0,
+        "sampled_at_ms": 12000
+      },
+      "last_test": {
+        "available": true,
+        "status": "pass",
+        "pass": true,
+        "changed": true,
+        "settle_ms": 150,
+        "before": {"state": "open", "raw_state": "HIGH", "closed": false},
+        "after": {"state": "closed", "raw_state": "LOW", "closed": true}
+      }
+    }
+  },
+  "switch_input_pin_options": [
+    {"pin": 2, "label": "D2"},
+    {"pin": 4, "label": "D4"}
+  ],
   "uptime_ms": 12000,
   "last_command": "{\"outputs\":{\"relay_1\":true}}"
 }
@@ -185,15 +255,17 @@ const char MQTT_CLIENT_ID[] = "lv-test-plate-uno-r4";
 
 ## Firmware Pin Mapping
 
-Default pins are at the top of `firmware/lv-test-plate/lv-test-plate.ino`:
+The active pin assignments at the top of `firmware/lv-test-plate/lv-test-plate.ino` are authoritative. Check the sketch before changing wiring or docs.
 
 ```cpp
-const int RELAY_1_PIN = 12; // D12
-const int RELAY_2_PIN = 13; // D13
-const int SSR_1_PIN = 3;    // D3
-const int PWM_PIN = 5;      // D5
-const int POT_PIN = A0;     // A0
+const int RELAY_1_PIN = 8;      // D8, digital relay output
+const int RELAY_2_PIN = 13;     // D13, digital relay output
+const int SSR_1_PIN = 3;        // D3, SSR output
+const int PWM_PIN = 5;          // D5, PWM-capable output
+const int POT_PIN = A0;         // A0, analog potentiometer input
 ```
+
+Switch input options are also defined in the sketch and published in board state as `switch_input_pin_options`. The current default options exclude the active output and potentiometer pins: `D2`, `D4`, `D6`, `D7`, `D9`, `D10`, `D11`, `D12`, `A1`, `A2`, `A3`, `A4`, and `A5`.
 
 Relay module and SSR polarity are configured separately. If either device is active-low, change only that device's pair:
 

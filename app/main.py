@@ -24,6 +24,11 @@ logger = logging.getLogger("lv-test-plate")
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 ASSET_VERSION = os.getenv("ASSET_VERSION", str(int(time.time())))
+SWITCH_CHANNELS = ("relay_1", "relay_2")
+SWITCH_MODES = {"NO", "NC"}
+SWITCH_PULL_MODES = {"pullup", "pulldown", "external"}
+DEFAULT_SWITCH_DEBOUNCE_MS = 30
+DEFAULT_SWITCH_SETTLE_MS = 150
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,8 @@ class DashboardState:
                 "pwm_enabled": False,
                 "pwm_value": 0,
             },
+            "switch_tests": _default_switch_tests(),
+            "switch_input_pin_options": [],
             "telemetry": {
                 "uptime_ms": None,
                 "wifi_rssi": None,
@@ -116,6 +123,28 @@ class DashboardState:
                 self._state["last_command"] = last_command
             return self._snapshot_locked()
 
+    def apply_switch_tests(self, switch_tests: dict[str, Any], last_command: Any | None = None) -> dict[str, Any]:
+        with self._lock:
+            _merge_switch_tests(self._state["switch_tests"], switch_tests)
+            if last_command is not None:
+                self._state["last_command"] = last_command
+            return self._snapshot_locked()
+
+    def apply_command_snapshot(
+        self,
+        outputs: dict[str, Any] | None = None,
+        switch_tests: dict[str, Any] | None = None,
+        last_command: Any | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if outputs is not None:
+                self._state["outputs"].update(_coerce_outputs(outputs))
+            if switch_tests is not None:
+                _merge_switch_tests(self._state["switch_tests"], switch_tests)
+            if last_command is not None:
+                self._state["last_command"] = last_command
+            return self._snapshot_locked()
+
     def apply_mqtt_message(self, topic_key: str, payload: Any) -> dict[str, Any]:
         now = time.time()
         with self._lock:
@@ -133,6 +162,12 @@ class DashboardState:
                 outputs = payload.get("outputs")
                 if isinstance(outputs, dict):
                     self._state["outputs"].update(_coerce_outputs(outputs))
+                switch_tests = payload.get("switch_tests")
+                if isinstance(switch_tests, dict):
+                    _merge_switch_tests(self._state["switch_tests"], switch_tests)
+                pin_options = payload.get("switch_input_pin_options")
+                if isinstance(pin_options, list):
+                    self._state["switch_input_pin_options"] = _coerce_pin_options(pin_options)
                 if "last_command" in payload:
                     self._state["last_command"] = payload["last_command"]
                 elif "last_command_received" in payload:
@@ -187,6 +222,113 @@ def _coerce_outputs(raw: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
     return coerced
+
+
+def _default_switch_reading() -> dict[str, Any]:
+    return {
+        "configured": False,
+        "raw": -1,
+        "raw_state": "n/a",
+        "closed": False,
+        "state": "unconfigured",
+        "bounce_count": 0,
+        "sampled_at_ms": None,
+    }
+
+
+def _default_switch_result() -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": "not_run",
+        "pass": False,
+        "changed": False,
+        "settle_ms": DEFAULT_SWITCH_SETTLE_MS,
+        "before": _default_switch_reading(),
+        "after": _default_switch_reading(),
+    }
+
+
+def _default_switch_tests() -> dict[str, dict[str, Any]]:
+    return {
+        channel: {
+            "enabled": False,
+            "pin": None,
+            "pin_label": "",
+            "mode": "NO",
+            "pull_mode": "pullup",
+            "effective_pull_mode": "pullup",
+            "debounce_ms": DEFAULT_SWITCH_DEBOUNCE_MS,
+            "settle_ms": DEFAULT_SWITCH_SETTLE_MS,
+            "configured": False,
+            "current": _default_switch_reading(),
+            "last_test": _default_switch_result(),
+        }
+        for channel in SWITCH_CHANNELS
+    }
+
+
+def _coerce_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _coerce_switch_config(raw: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = dict(existing or {})
+    coerced: dict[str, Any] = {}
+
+    if "enabled" in raw:
+        coerced["enabled"] = bool(raw["enabled"])
+    if "pin" in raw:
+        coerced["pin"] = None if raw["pin"] in (None, "") else _coerce_int(raw["pin"], -1, -1, 100)
+    if "pin_label" in raw:
+        coerced["pin_label"] = str(raw.get("pin_label") or "")
+    if "mode" in raw:
+        mode = str(raw.get("mode", "")).upper()
+        if mode in SWITCH_MODES:
+            coerced["mode"] = mode
+    if "pull_mode" in raw:
+        pull_mode = str(raw.get("pull_mode", "")).lower()
+        if pull_mode in SWITCH_PULL_MODES:
+            coerced["pull_mode"] = pull_mode
+    if "effective_pull_mode" in raw:
+        coerced["effective_pull_mode"] = str(raw.get("effective_pull_mode") or "")
+    if "debounce_ms" in raw:
+        coerced["debounce_ms"] = _coerce_int(raw["debounce_ms"], int(base.get("debounce_ms", DEFAULT_SWITCH_DEBOUNCE_MS)), 0, 1000)
+    if "settle_ms" in raw:
+        coerced["settle_ms"] = _coerce_int(raw["settle_ms"], int(base.get("settle_ms", DEFAULT_SWITCH_SETTLE_MS)), 0, 5000)
+    if "configured" in raw:
+        coerced["configured"] = bool(raw["configured"])
+    for key in ("current", "last_test"):
+        if isinstance(raw.get(key), dict):
+            coerced[key] = raw[key]
+
+    return coerced
+
+
+def _merge_switch_tests(target: dict[str, Any], raw: dict[str, Any]) -> None:
+    for channel in SWITCH_CHANNELS:
+        incoming = raw.get(channel)
+        if not isinstance(incoming, dict):
+            continue
+        current = target.setdefault(channel, _default_switch_tests()[channel])
+        current.update(_coerce_switch_config(incoming, current))
+
+
+def _coerce_pin_options(raw: list[Any]) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if "pin" not in item:
+            continue
+        pin = _coerce_int(item["pin"], -1, -1, 100)
+        if pin < 0:
+            continue
+        options.append({"pin": pin, "label": str(item.get("label") or f"D{pin}")})
+    return options
 
 
 def _parse_payload(payload: bytes) -> Any:
@@ -365,29 +507,61 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
 
     current_outputs = state.snapshot().get("outputs", {})
     next_outputs = _coerce_outputs(current_outputs)
+    output_command = False
+    switch_test_updates: dict[str, Any] | None = None
 
     toggle_key = command.get("toggle")
     if toggle_key is not None:
         if toggle_key not in {"relay_1", "relay_2", "ssr_1", "pwm_enabled"}:
             raise HTTPException(status_code=400, detail="Unsupported toggle output")
         next_outputs[toggle_key] = not bool(next_outputs.get(toggle_key, False))
+        output_command = True
     elif isinstance(command.get("set_outputs"), dict):
         next_outputs.update(_coerce_outputs(command["set_outputs"]))
+        output_command = True
     elif isinstance(command.get("outputs"), dict):
         next_outputs.update(_coerce_outputs(command["outputs"]))
-    else:
-        raise HTTPException(status_code=400, detail="Command must include toggle, set_outputs, or outputs")
+        output_command = True
+
+    if isinstance(command.get("switch_tests"), dict):
+        switch_test_updates = {}
+        for channel in SWITCH_CHANNELS:
+            config = command["switch_tests"].get(channel)
+            if isinstance(config, dict):
+                switch_test_updates[channel] = _coerce_switch_config(config)
+
+    read_switch = command.get("read_switch")
+    test_switch = command.get("test_switch")
+    if read_switch is not None and read_switch not in SWITCH_CHANNELS:
+        raise HTTPException(status_code=400, detail="Unsupported switch read channel")
+    if test_switch is not None and test_switch not in SWITCH_CHANNELS:
+        raise HTTPException(status_code=400, detail="Unsupported switch test channel")
+
+    if not output_command and not switch_test_updates and read_switch is None and test_switch is None:
+        raise HTTPException(status_code=400, detail="Command must include outputs, switch_tests, read_switch, or test_switch")
 
     payload = {
-        "outputs": next_outputs,
         "source": "web",
         "ts": time.time(),
     }
+    if output_command:
+        payload["outputs"] = next_outputs
+    if switch_test_updates:
+        payload["switch_tests"] = switch_test_updates
+    if read_switch is not None:
+        payload["read_switch"] = read_switch
+    if test_switch is not None:
+        payload["test_switch"] = test_switch
+
     info = mqtt_client.publish(settings.topics["cmd"], json.dumps(payload, separators=(",", ":")), qos=0, retain=False)
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
         raise HTTPException(status_code=503, detail=f"MQTT publish failed: {mqtt.error_string(info.rc)}")
 
-    snapshot = state.apply_outputs(next_outputs, last_command=payload)
+    snapshot = state.apply_command_snapshot(
+        outputs=next_outputs if output_command else None,
+        switch_tests=switch_test_updates,
+        last_command=payload,
+    )
     await hub.broadcast({"type": "command_sent", "data": snapshot, "payload": payload})
     return {"ok": True, "topic": settings.topics["cmd"], "payload": payload, "snapshot": snapshot}
 

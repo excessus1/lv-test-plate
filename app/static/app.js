@@ -1,4 +1,4 @@
-const APP_JS_VERSION = "latest-snapshot-2026-05-24-1";
+const APP_JS_VERSION = "switch-tests-2026-05-28-1";
 
 const DEFAULT_OUTPUTS = {
   relay_1: false,
@@ -6,6 +6,35 @@ const DEFAULT_OUTPUTS = {
   ssr_1: false,
   pwm_enabled: false,
   pwm_value: 0,
+};
+
+const SWITCH_CHANNELS = ["relay_1", "relay_2"];
+const DEFAULT_SWITCH_TEST = {
+  enabled: false,
+  pin: null,
+  pin_label: "",
+  mode: "NO",
+  pull_mode: "pullup",
+  effective_pull_mode: "pullup",
+  debounce_ms: 30,
+  settle_ms: 150,
+  configured: false,
+  current: {
+    configured: false,
+    raw: -1,
+    raw_state: "n/a",
+    closed: false,
+    state: "unconfigured",
+    bounce_count: 0,
+  },
+  last_test: {
+    available: false,
+    status: "not_run",
+    pass: false,
+    changed: false,
+    before: { state: "unconfigured", raw_state: "n/a" },
+    after: { state: "unconfigured", raw_state: "n/a" },
+  },
 };
 
 let latest = null;
@@ -30,6 +59,7 @@ const els = {
   outSsr1: document.querySelector("#out-ssr-1"),
   outPwm: document.querySelector("#out-pwm"),
   wsDebug: document.querySelector("#ws-debug"),
+  switchPanels: Array.from(document.querySelectorAll("[data-switch-channel]")),
 };
 
 function setDebug(text) {
@@ -74,10 +104,90 @@ function latestOutputs() {
   return { ...DEFAULT_OUTPUTS, ...normalizeOutputs(latest?.outputs) };
 }
 
+function latestSwitchTests() {
+  const switchTests = {};
+  SWITCH_CHANNELS.forEach((channel) => {
+    switchTests[channel] = { ...DEFAULT_SWITCH_TEST, ...(latest?.switch_tests?.[channel] || {}) };
+  });
+  return switchTests;
+}
+
+function pinOptions() {
+  return Array.isArray(latest?.switch_input_pin_options) ? latest.switch_input_pin_options : [];
+}
+
 function formatValue(value) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "string") return value;
   return JSON.stringify(value);
+}
+
+function formatSwitchState(reading) {
+  if (!reading?.configured) return "unconfigured";
+  return reading.state || (reading.closed ? "closed" : "open");
+}
+
+function formatSwitchResult(result) {
+  if (!result?.available) return "not run";
+  const before = formatSwitchState(result.before);
+  const after = formatSwitchState(result.after);
+  const changed = result.changed ? "changed" : "no change";
+  return `${result.status || "unknown"} (${before} -> ${after}, ${changed})`;
+}
+
+function syncPinSelect(select, config) {
+  const options = pinOptions();
+  const configuredPin = config.pin === null || config.pin === undefined || config.pin < 0 ? "" : String(config.pin);
+  select.textContent = "";
+
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = options.length > 0 ? "No switch input" : "Waiting for board pin map";
+  select.append(empty);
+
+  options.forEach((option) => {
+    const item = document.createElement("option");
+    item.value = String(option.pin);
+    item.textContent = option.label || `D${option.pin}`;
+    select.append(item);
+  });
+
+  if (configuredPin && !options.some((option) => String(option.pin) === configuredPin)) {
+    const current = document.createElement("option");
+    current.value = configuredPin;
+    current.textContent = config.pin_label || `Pin ${configuredPin}`;
+    select.append(current);
+  }
+
+  select.value = configuredPin;
+}
+
+function syncSwitchPanel(panel, config) {
+  panel.querySelector('[data-switch-field="enabled"]').checked = Boolean(config.enabled);
+  syncPinSelect(panel.querySelector('[data-switch-field="pin"]'), config);
+  panel.querySelector('[data-switch-field="mode"]').value = config.mode || "NO";
+  panel.querySelector('[data-switch-field="pull_mode"]').value = config.pull_mode || "pullup";
+  panel.querySelector('[data-switch-field="debounce_ms"]').value = config.debounce_ms ?? 30;
+  panel.querySelector('[data-switch-field="settle_ms"]').value = config.settle_ms ?? 150;
+
+  const current = config.current || {};
+  panel.querySelector('[data-switch-readout="current"]').textContent = `State: ${formatSwitchState(current)}`;
+  panel.querySelector('[data-switch-readout="raw"]').textContent = `Raw: ${current.raw_state || "n/a"} (${current.raw ?? "-"})`;
+  panel.querySelector('[data-switch-readout="result"]').textContent = `Result: ${formatSwitchResult(config.last_test)}`;
+  panel.classList.toggle("is-pass", Boolean(config.last_test?.available && config.last_test?.pass));
+  panel.classList.toggle("is-fail", Boolean(config.last_test?.available && config.last_test?.status === "fail"));
+}
+
+function collectSwitchConfig(panel) {
+  const pinValue = panel.querySelector('[data-switch-field="pin"]').value;
+  return {
+    enabled: panel.querySelector('[data-switch-field="enabled"]').checked,
+    pin: pinValue === "" ? null : Number.parseInt(pinValue, 10),
+    mode: panel.querySelector('[data-switch-field="mode"]').value,
+    pull_mode: panel.querySelector('[data-switch-field="pull_mode"]').value,
+    debounce_ms: Math.max(0, Math.min(1000, Number.parseInt(panel.querySelector('[data-switch-field="debounce_ms"]').value, 10) || 0)),
+    settle_ms: Math.max(0, Math.min(5000, Number.parseInt(panel.querySelector('[data-switch-field="settle_ms"]').value, 10) || 0)),
+  };
 }
 
 function syncPwmControl(outputs) {
@@ -136,6 +246,11 @@ function render(snapshot) {
   els.outRelay2.textContent = `relay_2: ${outputs.relay_2 ? "on" : "off"}`;
   els.outSsr1.textContent = `ssr_1: ${outputs.ssr_1 ? "on" : "off"}`;
   els.outPwm.textContent = `pwm: ${outputs.pwm_enabled ? "on" : "off"} / ${outputs.pwm_value}`;
+
+  const switchTests = latestSwitchTests();
+  els.switchPanels.forEach((panel) => {
+    syncSwitchPanel(panel, switchTests[panel.dataset.switchChannel]);
+  });
 }
 
 function send(command) {
@@ -165,12 +280,39 @@ function sendSetOutputs(changes) {
   });
 }
 
+function sendSwitchConfig(panel) {
+  const channel = panel.dataset.switchChannel;
+  return send({ switch_tests: { [channel]: collectSwitchConfig(panel) } }).catch((error) => {
+    els.message.textContent = `Switch config failed: ${error.message}`;
+  });
+}
+
 document.querySelectorAll(".toggle").forEach((button) => {
   button.addEventListener("click", () => {
     const key = button.dataset.output;
     console.debug("[lv-test-plate] latest outputs before click", latestOutputs());
     send({ toggle: key }).catch((error) => {
       els.message.textContent = `Command failed: ${error.message}`;
+    });
+  });
+});
+
+els.switchPanels.forEach((panel) => {
+  panel.querySelectorAll("[data-switch-field]").forEach((field) => {
+    field.addEventListener("change", () => {
+      sendSwitchConfig(panel);
+    });
+  });
+
+  panel.querySelector('[data-switch-action="read"]').addEventListener("click", () => {
+    send({ read_switch: panel.dataset.switchChannel }).catch((error) => {
+      els.message.textContent = `Switch read failed: ${error.message}`;
+    });
+  });
+
+  panel.querySelector('[data-switch-action="test"]').addEventListener("click", () => {
+    send({ test_switch: panel.dataset.switchChannel }).catch((error) => {
+      els.message.textContent = `Switch test failed: ${error.message}`;
     });
   });
 });
