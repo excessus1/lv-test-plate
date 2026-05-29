@@ -1,4 +1,4 @@
-const APP_JS_VERSION = "switch-tests-2026-05-28-1";
+const APP_JS_VERSION = "switch-tests-2026-05-28-2";
 
 const DEFAULT_OUTPUTS = {
   relay_1: false,
@@ -138,11 +138,12 @@ function formatSwitchResult(result) {
 function syncPinSelect(select, config) {
   const options = pinOptions();
   const configuredPin = config.pin === null || config.pin === undefined || config.pin < 0 ? "" : String(config.pin);
+  const hasBoardPinMap = options.length > 0;
   select.textContent = "";
 
   const empty = document.createElement("option");
   empty.value = "";
-  empty.textContent = options.length > 0 ? "No switch input" : "Waiting for board pin map";
+  empty.textContent = hasBoardPinMap ? "No switch input" : "no board pin map received";
   select.append(empty);
 
   options.forEach((option) => {
@@ -160,6 +161,8 @@ function syncPinSelect(select, config) {
   }
 
   select.value = configuredPin;
+  select.disabled = !hasBoardPinMap && !configuredPin;
+  select.title = hasBoardPinMap ? "" : "no board pin map received";
 }
 
 function syncSwitchPanel(panel, config) {
@@ -171,9 +174,13 @@ function syncSwitchPanel(panel, config) {
   panel.querySelector('[data-switch-field="settle_ms"]').value = config.settle_ms ?? 150;
 
   const current = config.current || {};
+  const optionCount = pinOptions().length;
+  const pinMapReadout = panel.querySelector('[data-switch-readout="pin-map"]');
   panel.querySelector('[data-switch-readout="current"]').textContent = `State: ${formatSwitchState(current)}`;
   panel.querySelector('[data-switch-readout="raw"]').textContent = `Raw: ${current.raw_state || "n/a"} (${current.raw ?? "-"})`;
   panel.querySelector('[data-switch-readout="result"]').textContent = `Result: ${formatSwitchResult(config.last_test)}`;
+  pinMapReadout.textContent = optionCount > 0 ? `Pin map: ${optionCount} board options` : "Pin map: no board pin map received";
+  pinMapReadout.classList.toggle("is-diagnostic", optionCount === 0);
   panel.classList.toggle("is-pass", Boolean(config.last_test?.available && config.last_test?.pass));
   panel.classList.toggle("is-fail", Boolean(config.last_test?.available && config.last_test?.status === "fail"));
 }

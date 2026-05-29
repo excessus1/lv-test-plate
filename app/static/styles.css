@@ -269,6 +269,12 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.switch-status span.is-diagnostic {
+  border-color: var(--warn);
+  color: var(--text);
+  background: var(--warn-bg);
+}
+
 .switch-actions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -36,6 +36,7 @@ const unsigned long DEFAULT_SWITCH_SETTLE_MS = 150;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long STATE_PUBLISH_INTERVAL_MS = 5000;
 const unsigned long TELEMETRY_PUBLISH_INTERVAL_MS = 2000;
+const size_t STATE_JSON_CAPACITY = 4096;
 
 WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
@@ -369,7 +370,7 @@ void writeSwitchChannel(JsonObject target, size_t index) {
 }
 
 void publishState(bool retained) {
-  StaticJsonDocument<3072> doc;
+  StaticJsonDocument<STATE_JSON_CAPACITY> doc;
   JsonObject out = doc.createNestedObject("outputs");
   out["relay_1"] = outputs.relay1;
   out["relay_2"] = outputs.relay2;
@@ -394,10 +395,41 @@ void publishState(bool retained) {
   doc["last_command"] = lastCommandSummary;
 
   String payload;
-  serializeJson(doc, payload);
-  mqttClient.beginMessage(stateTopic.c_str(), retained);
-  mqttClient.print(payload);
-  mqttClient.endMessage();
+  const size_t measuredJsonSize = measureJson(doc);
+  const size_t serializedJsonSize = serializeJson(doc, payload);
+  const bool jsonOverflowed = doc.overflowed();
+
+  Serial.print("publishState json_capacity=");
+  Serial.print(STATE_JSON_CAPACITY);
+  Serial.print(" measured=");
+  Serial.print(measuredJsonSize);
+  Serial.print(" serialized=");
+  Serial.print(serializedJsonSize);
+  Serial.print(" payload_len=");
+  Serial.print(payload.length());
+  Serial.print(" overflowed=");
+  Serial.println(jsonOverflowed ? "true" : "false");
+  if (jsonOverflowed) {
+    Serial.println("publishState ERROR: ArduinoJson overflowed; state payload is incomplete");
+  }
+
+  const int beginOk = mqttClient.beginMessage(stateTopic.c_str(), (unsigned long)payload.length(), retained);
+  size_t mqttBytesWritten = 0;
+  int endOk = 0;
+  if (beginOk) {
+    mqttBytesWritten = mqttClient.print(payload);
+    endOk = mqttClient.endMessage();
+  }
+
+  Serial.print("publishState mqtt_begin=");
+  Serial.print(beginOk);
+  Serial.print(" mqtt_written=");
+  Serial.print(mqttBytesWritten);
+  Serial.print(" mqtt_end=");
+  Serial.println(endOk);
+  if (!beginOk || !endOk || mqttBytesWritten != payload.length()) {
+    Serial.println("publishState ERROR: MQTT state publish did not write the full payload");
+  }
 }
 
 void publishTelemetry() {
