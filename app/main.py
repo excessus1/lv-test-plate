@@ -105,6 +105,10 @@ class DashboardState:
                 "telemetry": None,
                 "status": None,
             },
+            "latency": {
+                "last_command": None,
+                "last_state": None,
+            },
         }
 
     def _snapshot_locked(self) -> dict[str, Any]:
@@ -140,18 +144,33 @@ class DashboardState:
         outputs: dict[str, Any] | None = None,
         switch_tests: dict[str, Any] | None = None,
         last_command: Any | None = None,
+        latency: dict[str, Any] | None = None,
+        pending_switch_channels: list[str] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             if outputs is not None:
                 self._state["outputs"].update(_coerce_outputs(outputs))
             if switch_tests is not None:
-                _merge_switch_tests(self._state["switch_tests"], switch_tests)
+                _merge_switch_tests(self._state["switch_tests"], switch_tests, clear_pending_on_ack=False)
+            if pending_switch_channels and last_command is not None:
+                command_seq = _coerce_int(last_command.get("command_seq"), 0, 0, 2_147_483_647)
+                command_id = str(last_command.get("command_id") or "")
+                for channel in pending_switch_channels:
+                    if channel in SWITCH_CHANNELS:
+                        current = self._state["switch_tests"].setdefault(channel, _default_switch_tests()[channel])
+                        current["command_seq"] = max(_coerce_int(current.get("command_seq"), 0, 0, 2_147_483_647), command_seq)
+                        current["command_id"] = command_id
+                        current["pending"] = True
+                        current["pending_action"] = last_command.get("read_switch") or last_command.get("test_switch") or last_command.get("observe_switch") or last_command.get("stop_observation") or "switch_config"
             if last_command is not None:
                 self._state["last_command"] = last_command
+            if latency is not None:
+                self._state["latency"]["last_command"] = latency
             return self._snapshot_locked()
 
-    def apply_mqtt_message(self, topic_key: str, payload: Any) -> dict[str, Any]:
+    def apply_mqtt_message(self, topic_key: str, payload: Any, payload_size: int | None = None, mqtt_received_at: float | None = None) -> dict[str, Any]:
         now = time.time()
+        received_at = mqtt_received_at or now
         with self._lock:
             self._state["messages"][topic_key] = payload
             if topic_key == "status":
@@ -164,12 +183,26 @@ class DashboardState:
                     }
                 )
             elif topic_key == "state" and isinstance(payload, dict):
+                previous_uptime = self._state["telemetry"].get("uptime_ms")
+                incoming_uptime = payload.get("uptime_ms")
+                reboot_detected = _uptime_reset_detected(previous_uptime, incoming_uptime)
+                if reboot_detected:
+                    self._state["switch_tests"] = _default_switch_tests()
                 outputs = payload.get("outputs")
                 if isinstance(outputs, dict):
                     self._state["outputs"].update(_coerce_outputs(outputs))
                 switch_tests = payload.get("switch_tests")
                 if isinstance(switch_tests, dict):
                     _merge_switch_tests(self._state["switch_tests"], switch_tests)
+                elif reboot_detected:
+                    self._state["latency"]["last_state"] = {
+                        "command_id": payload.get("command_id"),
+                        "payload_bytes": payload_size,
+                        "fastapi_mqtt_received_ts_ms": round(received_at * 1000, 3),
+                        "fastapi_state_updated_ts_ms": round(now * 1000, 3),
+                        "firmware": payload.get("timing") if isinstance(payload.get("timing"), dict) else {},
+                        "diagnostic": "switch_tests_reset_after_board_uptime_reset",
+                    }
                 pin_options = payload.get("switch_input_pin_options")
                 if isinstance(pin_options, list):
                     coerced_pin_options = _coerce_pin_options(pin_options)
@@ -182,6 +215,14 @@ class DashboardState:
                 elif "last_command_received" in payload:
                     self._state["last_command"] = payload["last_command_received"]
                 self._state["telemetry"]["uptime_ms"] = payload.get("uptime_ms", self._state["telemetry"]["uptime_ms"])
+                if not reboot_detected or isinstance(switch_tests, dict):
+                    self._state["latency"]["last_state"] = {
+                        "command_id": payload.get("command_id"),
+                        "payload_bytes": payload_size,
+                        "fastapi_mqtt_received_ts_ms": round(received_at * 1000, 3),
+                        "fastapi_state_updated_ts_ms": round(now * 1000, 3),
+                        "firmware": payload.get("timing") if isinstance(payload.get("timing"), dict) else {},
+                    }
             elif topic_key == "capabilities" and isinstance(payload, dict):
                 capabilities = _coerce_capabilities(payload, now)
                 self._state["capabilities"].update(capabilities)
@@ -298,6 +339,10 @@ def _default_switch_tests() -> dict[str, dict[str, Any]]:
             "relay_follow_enabled": False,
             "commanded_by": "manual",
             "status": "not_configured",
+            "command_id": "",
+            "command_seq": 0,
+            "pending": False,
+            "pending_action": None,
             "current": _default_switch_reading(),
             "observation": _default_switch_observation(),
             "last_test": _default_switch_result(),
@@ -327,6 +372,15 @@ def _coerce_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, parsed))
+
+
+def _uptime_reset_detected(previous: Any, incoming: Any) -> bool:
+    try:
+        previous_ms = int(previous)
+        incoming_ms = int(incoming)
+    except (TypeError, ValueError):
+        return False
+    return previous_ms > 30000 and incoming_ms + 5000 < previous_ms
 
 
 def _coerce_switch_config(raw: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -372,6 +426,14 @@ def _coerce_switch_config(raw: dict[str, Any], existing: dict[str, Any] | None =
         coerced["commanded_by"] = str(raw.get("commanded_by") or "")
     if "status" in raw:
         coerced["status"] = str(raw.get("status") or "")
+    if "command_id" in raw:
+        coerced["command_id"] = str(raw.get("command_id") or "")
+    if "command_seq" in raw:
+        coerced["command_seq"] = _coerce_int(raw["command_seq"], int(base.get("command_seq", 0)), 0, 2_147_483_647)
+    if "pending" in raw:
+        coerced["pending"] = bool(raw["pending"])
+    if "pending_action" in raw:
+        coerced["pending_action"] = raw.get("pending_action")
     for key in ("current", "observation", "last_test"):
         if isinstance(raw.get(key), dict):
             coerced[key] = raw[key]
@@ -379,13 +441,22 @@ def _coerce_switch_config(raw: dict[str, Any], existing: dict[str, Any] | None =
     return coerced
 
 
-def _merge_switch_tests(target: dict[str, Any], raw: dict[str, Any]) -> None:
+def _merge_switch_tests(target: dict[str, Any], raw: dict[str, Any], enforce_sequence: bool = True, clear_pending_on_ack: bool = True) -> None:
     for channel in SWITCH_CHANNELS:
         incoming = raw.get(channel)
         if not isinstance(incoming, dict):
             continue
         current = target.setdefault(channel, _default_switch_tests()[channel])
-        current.update(_coerce_switch_config(incoming, current))
+        current_seq = _coerce_int(current.get("command_seq"), 0, 0, 2_147_483_647)
+        incoming_seq = _coerce_int(incoming.get("command_seq"), 0, 0, 2_147_483_647)
+        if enforce_sequence and incoming_seq < current_seq:
+            logger.info("Ignoring stale switch_tests for %s incoming_seq=%s current_seq=%s", channel, incoming_seq, current_seq)
+            continue
+        coerced = _coerce_switch_config(incoming, current)
+        if clear_pending_on_ack and incoming_seq >= current_seq and incoming_seq > 0:
+            coerced["pending"] = False
+            coerced["pending_action"] = None
+        current.update(coerced)
 
 
 def _coerce_pin_options(raw: list[Any]) -> list[dict[str, Any]]:
@@ -467,6 +538,30 @@ def _parse_payload(payload: bytes) -> Any:
         return text
 
 
+def _json_payload_size(payload: Any) -> int:
+    return len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+
+
+def _state_payload_size_variants(payload: dict[str, Any]) -> dict[str, int]:
+    current = _json_payload_size(payload)
+    slim = json.loads(json.dumps(payload))
+    switch_tests = slim.get("switch_tests")
+    if isinstance(switch_tests, dict):
+        for channel in switch_tests.values():
+            if not isinstance(channel, dict):
+                continue
+            observation = channel.get("observation")
+            if isinstance(observation, dict) and not observation.get("active") and not observation.get("available"):
+                channel.pop("observation", None)
+            last_test = channel.get("last_test")
+            if isinstance(last_test, dict) and not last_test.get("available"):
+                channel.pop("last_test", None)
+    return {
+        "current": current,
+        "without_inactive_details": _json_payload_size(slim),
+    }
+
+
 def _decode_json_value_after_key(text: str, key: str) -> Any:
     marker = f'"{key}"'
     marker_index = text.find(marker)
@@ -503,6 +598,8 @@ state = DashboardState(settings)
 hub = WebSocketHub()
 mqtt_client: mqtt.Client | None = None
 event_loop: asyncio.AbstractEventLoop | None = None
+command_sequence = 0
+command_sequence_lock = Lock()
 
 
 def _schedule_broadcast(
@@ -514,6 +611,13 @@ def _schedule_broadcast(
         message = {"type": message_type, "data": snapshot}
         message.update(extra)
         asyncio.run_coroutine_threadsafe(hub.broadcast(message), event_loop)
+
+
+def _next_command_sequence() -> int:
+    global command_sequence
+    with command_sequence_lock:
+        command_sequence += 1
+        return command_sequence
 
 
 def _mqtt_connected(reason_code: Any) -> bool:
@@ -551,6 +655,7 @@ def _make_mqtt_client() -> mqtt.Client:
         _schedule_broadcast(snapshot)
 
     def on_message(_client: mqtt.Client, _userdata: Any, message: mqtt.MQTTMessage) -> None:
+        mqtt_received_at = time.time()
         topic_key = topic_lookup.get(message.topic)
         if not topic_key:
             return
@@ -560,8 +665,31 @@ def _make_mqtt_client() -> mqtt.Client:
             if recovered_payload is not None:
                 logger.debug("Recovered outputs from malformed MQTT state payload")
                 payload = recovered_payload
-        logger.info("MQTT %s payload received", topic_key)
-        snapshot = state.apply_mqtt_message(topic_key, payload)
+        command_id = payload.get("command_id") if isinstance(payload, dict) else None
+        firmware_timing = payload.get("timing") if isinstance(payload, dict) and isinstance(payload.get("timing"), dict) else {}
+        logger.info(
+            "MQTT %s payload received bytes=%s command_id=%s firmware_sample_ms=%s",
+            topic_key,
+            len(message.payload),
+            command_id or "-",
+            firmware_timing.get("firmware_switch_sampled_ms", "-"),
+        )
+        if topic_key == "state" and isinstance(payload, dict):
+            size_variants = _state_payload_size_variants(payload)
+            logger.info(
+                "MQTT state payload size current=%s without_inactive_details=%s saved_if_split=%s",
+                size_variants["current"],
+                size_variants["without_inactive_details"],
+                size_variants["current"] - size_variants["without_inactive_details"],
+            )
+        snapshot = state.apply_mqtt_message(topic_key, payload, payload_size=len(message.payload), mqtt_received_at=mqtt_received_at)
+        if topic_key == "state":
+            logger.info(
+                "FastAPI state updated command_id=%s updated_ts_ms=%s payload_bytes=%s",
+                snapshot.get("latency", {}).get("last_state", {}).get("command_id") or "-",
+                snapshot.get("latency", {}).get("last_state", {}).get("fastapi_state_updated_ts_ms"),
+                len(message.payload),
+            )
         _schedule_broadcast(
             snapshot,
             message_type="mqtt_message",
@@ -628,9 +756,14 @@ async def get_state() -> dict[str, Any]:
 
 @app.post("/api/command")
 async def post_command(command: dict[str, Any]) -> dict[str, Any]:
-    if mqtt_client is None or not mqtt_client.is_connected():
-        raise HTTPException(status_code=503, detail="MQTT is not connected")
-
+    api_received_at = time.time()
+    api_received_ts_ms = round(api_received_at * 1000, 3)
+    logger.info(
+        "API request received command_id=%s keys=%s received_ts_ms=%.3f",
+        command.get("command_id") or "-",
+        ",".join(sorted(str(key) for key in command.keys())),
+        api_received_ts_ms,
+    )
     current_snapshot = state.snapshot()
     current_outputs = current_snapshot.get("outputs", {})
     next_outputs = _coerce_outputs(current_outputs)
@@ -678,19 +811,43 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
 
     effective_switch_tests = json.loads(json.dumps(current_snapshot.get("switch_tests", _default_switch_tests())))
     if switch_test_updates:
-        _merge_switch_tests(effective_switch_tests, switch_test_updates)
+        _merge_switch_tests(effective_switch_tests, switch_test_updates, enforce_sequence=False)
 
     for relay in ("relay_1", "relay_2"):
         config = effective_switch_tests.get(relay, {})
         if relay in modified_outputs and config.get("enabled") and config.get("test_mode") == "relay_follow":
             raise HTTPException(status_code=409, detail=f"{relay} is controlled by relay-follow mode")
 
+    if switch_test_updates:
+        for channel, config in effective_switch_tests.items():
+            if channel in switch_test_updates and config.get("enabled") and config.get("pin") in (None, "", -1):
+                raise HTTPException(status_code=400, detail=f"{channel} needs an input pin before it can be enabled")
+
     if not output_command and not switch_test_updates and read_switch is None and test_switch is None and observe_switch is None and stop_observation is None:
         raise HTTPException(status_code=400, detail="Command must include outputs, switch_tests, read_switch, test_switch, or observe_switch")
 
+    command_id = str(command.get("command_id") or uuid.uuid4().hex[:12])
+    command_seq = _next_command_sequence()
+    pending_switch_channels: list[str] = []
+    if switch_test_updates:
+        for channel, update in switch_test_updates.items():
+            update["command_id"] = command_id
+            update["command_seq"] = command_seq
+            update["pending"] = True
+            update["pending_action"] = "switch_config"
+            pending_switch_channels.append(channel)
+    for channel in (read_switch, test_switch, observe_switch, stop_observation):
+        if channel in SWITCH_CHANNELS and channel not in pending_switch_channels:
+            pending_switch_channels.append(channel)
     payload = {
+        "command_id": command_id,
+        "command_seq": command_seq,
+        "client_command_seq": command.get("client_command_seq"),
         "source": "web",
         "ts": time.time(),
+        "client_click_ts_ms": command.get("client_click_ts_ms"),
+        "client_perf_click_ms": command.get("client_perf_click_ms"),
+        "server_api_received_ts_ms": api_received_ts_ms,
     }
     if output_command:
         payload["outputs"] = next_outputs
@@ -705,14 +862,46 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
     if stop_observation is not None:
         payload["stop_observation"] = stop_observation
 
-    info = mqtt_client.publish(settings.topics["cmd"], json.dumps(payload, separators=(",", ":")), qos=0, retain=False)
+    payload["server_mqtt_publish_ts_ms"] = round(time.time() * 1000, 3)
+    encoded_payload = json.dumps(payload, separators=(",", ":"))
+    logger.info(
+        "API command received command_id=%s bytes=%s read_switch=%s test_switch=%s observe_switch=%s",
+        command_id,
+        len(encoded_payload.encode("utf-8")),
+        read_switch or "-",
+        test_switch or "-",
+        observe_switch or "-",
+    )
+    if mqtt_client is None or not mqtt_client.is_connected():
+        raise HTTPException(status_code=503, detail="MQTT is not connected")
+    info = mqtt_client.publish(settings.topics["cmd"], encoded_payload, qos=0, retain=False)
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
         raise HTTPException(status_code=503, detail=f"MQTT publish failed: {mqtt.error_string(info.rc)}")
+    api_response_ts_ms = round(time.time() * 1000, 3)
+    latency = {
+        "command_id": command_id,
+        "command_seq": command_seq,
+        "payload_bytes": len(encoded_payload.encode("utf-8")),
+        "client_click_ts_ms": payload.get("client_click_ts_ms"),
+        "client_perf_click_ms": payload.get("client_perf_click_ms"),
+        "server_api_received_ts_ms": api_received_ts_ms,
+        "server_mqtt_publish_ts_ms": payload["server_mqtt_publish_ts_ms"],
+        "server_api_response_ts_ms": api_response_ts_ms,
+    }
+    logger.info(
+        "API command published command_id=%s publish_rc=%s api_to_publish_ms=%.3f api_total_ms=%.3f",
+        command_id,
+        info.rc,
+        payload["server_mqtt_publish_ts_ms"] - api_received_ts_ms,
+        api_response_ts_ms - api_received_ts_ms,
+    )
 
     snapshot = state.apply_command_snapshot(
         outputs=next_outputs if output_command else None,
         switch_tests=switch_test_updates,
         last_command=payload,
+        latency=latency,
+        pending_switch_channels=pending_switch_channels,
     )
     await hub.broadcast({"type": "command_sent", "data": snapshot, "payload": payload})
     return {"ok": True, "topic": settings.topics["cmd"], "payload": payload, "snapshot": snapshot}

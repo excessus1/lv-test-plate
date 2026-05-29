@@ -46,7 +46,7 @@ const unsigned long TELEMETRY_PUBLISH_INTERVAL_MS = 2000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_POLL_DIAGNOSTIC_INTERVAL_MS = 5000;
 const char* SKETCH_ID = "lv-test-plate";
-const char* FIRMWARE_VERSION = "2026-05-29-switch-modes-1";
+const char* FIRMWARE_VERSION = "2026-05-29-ordered-switch-state-1";
 const size_t STATE_JSON_CAPACITY = 6144;
 const size_t CAPABILITIES_JSON_CAPACITY = 2048;
 
@@ -147,6 +147,12 @@ SwitchObservation switchObservations[SWITCH_CHANNEL_COUNT];
 const char* relayCommandedBy[SWITCH_CHANNEL_COUNT] = {"manual", "manual"};
 const char* switchChannelStatus[SWITCH_CHANNEL_COUNT] = {"not_configured", "not_configured"};
 char lastCommandSummaryBuffer[96] = "";
+char lastCommandId[48] = "";
+unsigned long lastCommandSeq = 0;
+unsigned long switchChannelSeq[SWITCH_CHANNEL_COUNT] = {0, 0};
+unsigned long lastCommandReceivedMs = 0;
+unsigned long lastSwitchSampledMs = 0;
+unsigned long lastStatePublishStartedMs = 0;
 unsigned long lastMqttAttempt = 0;
 unsigned long lastWifiAttempt = 0;
 unsigned long lastStatePublish = 0;
@@ -165,6 +171,10 @@ void setLastCommandSummary(const char* value) {
 void setLastCommandSummary2(const char* prefix, const char* value) {
   snprintf(lastCommandSummaryBuffer, sizeof(lastCommandSummaryBuffer), "%s%s", prefix, value);
   stateDirty = true;
+}
+
+void setLastCommandId(const char* value) {
+  snprintf(lastCommandId, sizeof(lastCommandId), "%s", value == nullptr ? "" : value);
 }
 
 void printResetDiagnostics() {
@@ -372,6 +382,9 @@ SwitchReading readSwitch(size_t index) {
   SwitchReading reading;
   reading.sampledAt = millis();
   if (!switchConfigured(index)) {
+    if (index < SWITCH_CHANNEL_COUNT) {
+      switchReadings[index] = reading;
+    }
     return reading;
   }
 
@@ -780,6 +793,8 @@ void writeSwitchChannel(JsonObject target, size_t index) {
   target["relay_follow_enabled"] = config.testMode == SWITCH_TEST_RELAY_FOLLOW;
   target["commanded_by"] = relayCommandedBy[index];
   target["status"] = switchChannelStatus[index];
+  target["command_id"] = lastCommandId;
+  target["command_seq"] = switchChannelSeq[index];
 
   JsonObject current = target.createNestedObject("current");
   writeSwitchReading(current, switchReadings[index]);
@@ -808,7 +823,16 @@ bool shouldIncludeSwitchTests(bool forceSwitchTests) {
 #endif
 }
 
-void publishState(bool retained, bool forceSwitchTests = false) {
+void publishState(bool retained, bool forceSwitchTests = false, int onlySwitchChannel = -1) {
+  lastStatePublishStartedMs = millis();
+  Serial.print("publishState start command_id=");
+  Serial.print(lastCommandId);
+  Serial.print(" started_ms=");
+  Serial.print(lastStatePublishStartedMs);
+  Serial.print(" force_switch_tests=");
+  Serial.print(forceSwitchTests ? "true" : "false");
+  Serial.print(" only_switch_channel=");
+  Serial.println(onlySwitchChannel);
   StaticJsonDocument<STATE_JSON_CAPACITY> doc;
   JsonObject out = doc.createNestedObject("outputs");
   out["relay_1"] = outputs.relay1;
@@ -820,15 +844,26 @@ void publishState(bool retained, bool forceSwitchTests = false) {
   const bool includeSwitchTests = shouldIncludeSwitchTests(forceSwitchTests);
   if (includeSwitchTests) {
     JsonObject switchTests = doc.createNestedObject("switch_tests");
-    for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
-      JsonObject channel = switchTests.createNestedObject(SWITCH_CHANNEL_KEYS[i]);
-      writeSwitchChannel(channel, i);
+    if (onlySwitchChannel >= 0 && onlySwitchChannel < (int)SWITCH_CHANNEL_COUNT) {
+      JsonObject channel = switchTests.createNestedObject(SWITCH_CHANNEL_KEYS[onlySwitchChannel]);
+      writeSwitchChannel(channel, (size_t)onlySwitchChannel);
+    } else {
+      for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
+        JsonObject channel = switchTests.createNestedObject(SWITCH_CHANNEL_KEYS[i]);
+        writeSwitchChannel(channel, i);
+      }
     }
   }
 
   doc["uptime_ms"] = millis();
   doc["last_command"] = lastCommandSummaryBuffer;
+  doc["command_id"] = lastCommandId;
+  doc["command_seq"] = lastCommandSeq;
   doc["switch_tests_included"] = includeSwitchTests;
+  JsonObject timing = doc.createNestedObject("timing");
+  timing["firmware_command_received_ms"] = lastCommandReceivedMs;
+  timing["firmware_switch_sampled_ms"] = lastSwitchSampledMs;
+  timing["firmware_state_publish_started_ms"] = lastStatePublishStartedMs;
 
   if (publishJsonDocument("publishState", stateTopic, retained, doc, STATE_JSON_CAPACITY)) {
     stateDirty = false;
@@ -881,16 +916,18 @@ void updateLastCommandSummary(const JsonObject& out) {
 #undef APPEND_SUMMARY_PART
 }
 
-bool updateSwitchConfig(size_t index, JsonObject configDoc) {
+bool updateSwitchConfig(size_t index, JsonObject configDoc, unsigned long commandSeq) {
   if (index >= SWITCH_CHANNEL_COUNT || configDoc.isNull()) {
     return false;
   }
 
   SwitchConfig& config = switchConfigs[index];
   bool changed = false;
+  bool requestedEnabled = config.enabled;
 
   if (configDoc.containsKey("enabled")) {
-    config.enabled = configDoc["enabled"].as<bool>();
+    requestedEnabled = configDoc["enabled"].as<bool>();
+    config.enabled = requestedEnabled;
     changed = true;
   }
   if (configDoc.containsKey("pin")) {
@@ -928,6 +965,12 @@ bool updateSwitchConfig(size_t index, JsonObject configDoc) {
   }
 
   if (changed) {
+    switchChannelSeq[index] = commandSeq;
+    if (config.enabled && !isSwitchPinAllowed(config.pin)) {
+      config.enabled = false;
+      config.pin = NO_SWITCH_PIN;
+      switchChannelStatus[index] = requestedEnabled ? "invalid_config" : "disabled";
+    }
     configureSwitchPin(index);
     if (switchObservations[index].active && config.testMode != SWITCH_TEST_TIMED_OBSERVATION) {
       finishSwitchObservation(index, "cancelled");
@@ -944,7 +987,7 @@ bool relayFollowOwnsOutput(size_t index) {
   return index < SWITCH_CHANNEL_COUNT && switchConfigs[index].enabled && switchConfigs[index].testMode == SWITCH_TEST_RELAY_FOLLOW;
 }
 
-bool updateSwitchConfigs(JsonObject switchTests) {
+bool updateSwitchConfigs(JsonObject switchTests, unsigned long commandSeq, int& touchedSwitchIndex) {
   if (switchTests.isNull()) {
     return false;
   }
@@ -953,15 +996,19 @@ bool updateSwitchConfigs(JsonObject switchTests) {
   for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
     JsonObject configDoc = switchTests[SWITCH_CHANNEL_KEYS[i]];
     if (!configDoc.isNull()) {
-      changed = updateSwitchConfig(i, configDoc) || changed;
+      touchedSwitchIndex = touchedSwitchIndex == -1 ? (int)i : -2;
+      changed = updateSwitchConfig(i, configDoc, commandSeq) || changed;
     }
   }
   return changed;
 }
 
 void handleCommand(int messageSize) {
+  lastCommandReceivedMs = millis();
   Serial.print("handleCommand message_size=");
-  Serial.println(messageSize);
+  Serial.print(messageSize);
+  Serial.print(" received_ms=");
+  Serial.println(lastCommandReceivedMs);
 
   char payload[1537];
   size_t payloadLength = 0;
@@ -990,9 +1037,31 @@ void handleCommand(int messageSize) {
     return;
   }
 
+  setLastCommandId(doc["command_id"].as<const char*>());
+  lastCommandSeq = doc["command_seq"].as<unsigned long>();
+  lastSwitchSampledMs = 0;
+  Serial.print("handleCommand command_id=");
+  Serial.print(lastCommandId);
+  Serial.print(" command_seq=");
+  Serial.print(lastCommandSeq);
+  Serial.print(" client_click_ts_ms=");
+  if (doc.containsKey("client_click_ts_ms")) {
+    Serial.print(doc["client_click_ts_ms"].as<double>(), 0);
+  } else {
+    Serial.print("n/a");
+  }
+  Serial.print(" server_api_received_ts_ms=");
+  if (doc.containsKey("server_api_received_ts_ms")) {
+    Serial.print(doc["server_api_received_ts_ms"].as<double>(), 0);
+  } else {
+    Serial.print("n/a");
+  }
+  Serial.println();
+
   bool handled = false;
+  int touchedSwitchIndex = -1;
   JsonObject switchTests = doc["switch_tests"];
-  if (updateSwitchConfigs(switchTests)) {
+  if (updateSwitchConfigs(switchTests, lastCommandSeq, touchedSwitchIndex)) {
     setLastCommandSummary("switch_config");
     handled = true;
   }
@@ -1026,7 +1095,20 @@ void handleCommand(int messageSize) {
     const char* channel = doc["read_switch"].as<const char*>();
     int index = switchChannelIndex(channel);
     if (index >= 0) {
-      readSwitch((size_t)index);
+      switchChannelSeq[index] = lastCommandSeq;
+      touchedSwitchIndex = (int)index;
+      SwitchReading reading = readSwitch((size_t)index);
+      lastSwitchSampledMs = reading.sampledAt;
+      Serial.print("read_switch command_id=");
+      Serial.print(lastCommandId);
+      Serial.print(" channel=");
+      Serial.print(SWITCH_CHANNEL_KEYS[index]);
+      Serial.print(" sampled_ms=");
+      Serial.print(lastSwitchSampledMs);
+      Serial.print(" raw=");
+      Serial.print(reading.raw);
+      Serial.print(" state=");
+      Serial.println(reading.configured ? (reading.closed ? "closed" : "open") : "unconfigured");
       setLastCommandSummary2("switch_read:", SWITCH_CHANNEL_KEYS[index]);
     } else {
       setLastCommandSummary("switch_read:invalid_channel");
@@ -1038,6 +1120,8 @@ void handleCommand(int messageSize) {
     const char* channel = doc["test_switch"].as<const char*>();
     int index = switchChannelIndex(channel);
     if (index >= 0) {
+      switchChannelSeq[index] = lastCommandSeq;
+      touchedSwitchIndex = (int)index;
       runSwitchTest((size_t)index);
       setLastCommandSummary2("switch_test:", SWITCH_CHANNEL_KEYS[index]);
     } else {
@@ -1050,6 +1134,8 @@ void handleCommand(int messageSize) {
     const char* channel = doc["observe_switch"].as<const char*>();
     int index = switchChannelIndex(channel);
     if (index >= 0) {
+      switchChannelSeq[index] = lastCommandSeq;
+      touchedSwitchIndex = (int)index;
       if (switchConfigs[index].testMode == SWITCH_TEST_TIMED_OBSERVATION) {
         startSwitchObservation((size_t)index);
         setLastCommandSummary2("switch_observe:", SWITCH_CHANNEL_KEYS[index]);
@@ -1066,6 +1152,8 @@ void handleCommand(int messageSize) {
     const char* channel = doc["stop_observation"].as<const char*>();
     int index = switchChannelIndex(channel);
     if (index >= 0) {
+      switchChannelSeq[index] = lastCommandSeq;
+      touchedSwitchIndex = (int)index;
       finishSwitchObservation((size_t)index, "cancelled");
       setLastCommandSummary2("switch_observe_cancel:", SWITCH_CHANNEL_KEYS[index]);
     } else {
@@ -1079,7 +1167,7 @@ void handleCommand(int messageSize) {
   }
 
   applyOutputs();
-  publishState(true, true);
+  publishState(true, true, touchedSwitchIndex >= 0 ? touchedSwitchIndex : -1);
 }
 
 void connectWifi() {
@@ -1154,7 +1242,7 @@ void connectMqtt() {
 #else
     Serial.println("publishCapabilities disabled by LVTP_ENABLE_CAPABILITIES_PUBLISH=0");
 #endif
-    publishState(true);
+    publishState(true, true);
   } else {
     Serial.print("MQTT failed, error ");
     Serial.print(mqttClient.connectError());

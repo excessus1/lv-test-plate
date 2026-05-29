@@ -1,4 +1,4 @@
-const APP_JS_VERSION = "switch-modes-2026-05-29-1";
+const APP_JS_VERSION = "ordered-switch-state-2026-05-29-1";
 
 const DEFAULT_OUTPUTS = {
   relay_1: false,
@@ -32,6 +32,10 @@ const DEFAULT_SWITCH_TEST = {
     state: "unconfigured",
     bounce_count: 0,
   },
+  command_id: "",
+  command_seq: 0,
+  pending: false,
+  pending_action: null,
   observation: {
     active: false,
     available: false,
@@ -53,6 +57,8 @@ const DEFAULT_SWITCH_TEST = {
 };
 
 let latest = null;
+let lastRenderedStateCommandId = null;
+let clientCommandSeq = 0;
 
 const pwmSync = {
   allowServerSync: true,
@@ -127,6 +133,27 @@ function latestSwitchTests() {
   return switchTests;
 }
 
+function commandSeq(config) {
+  const value = Number.parseInt(config?.command_seq, 10);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function reconcileSnapshot(snapshot) {
+  if (!latest || !snapshot?.switch_tests) return snapshot;
+  const reconciled = JSON.parse(JSON.stringify(snapshot));
+  SWITCH_CHANNELS.forEach((channel) => {
+    const incoming = reconciled.switch_tests?.[channel];
+    const current = latest.switch_tests?.[channel];
+    if (!incoming || !current) return;
+    const incomingSeq = commandSeq(incoming);
+    const currentSeq = commandSeq(current);
+    if (incomingSeq < currentSeq) {
+      reconciled.switch_tests[channel] = current;
+    }
+  });
+  return reconciled;
+}
+
 function pinOptions() {
   if (Array.isArray(latest?.capabilities?.switch_input_pin_options) && latest.capabilities.switch_input_pin_options.length > 0) {
     return latest.capabilities.switch_input_pin_options;
@@ -162,6 +189,9 @@ function formatObservation(observation) {
 }
 
 function formatModeResult(config) {
+  if (config.pending) {
+    return `Applying: ${config.pending_action || "switch command"} (#${config.command_seq || "-"})`;
+  }
   const mode = config.test_mode || "passive_read";
   if (mode === "timed_observation") {
     return `Observation: ${formatObservation(config.observation)}`;
@@ -241,6 +271,7 @@ function syncSwitchPanel(panel, config) {
   pinMapReadout.classList.toggle("is-diagnostic", optionCount === 0);
   panel.classList.toggle("is-pass", Boolean(config.last_test?.available && config.last_test?.pass));
   panel.classList.toggle("is-fail", Boolean(config.last_test?.available && config.last_test?.status === "fail"));
+  panel.classList.toggle("is-pending", Boolean(config.pending));
 }
 
 function collectSwitchConfig(panel) {
@@ -278,9 +309,41 @@ function syncPwmControl(outputs) {
   }
 }
 
-function render(snapshot) {
+function commandId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function summarizeLatency(snapshot, renderStartedMs, source) {
+  const latency = snapshot?.latency || {};
+  const command = latency.last_command || {};
+  const state = latency.last_state || {};
+  const stateCommandId = state.command_id;
+  if (!stateCommandId || stateCommandId === lastRenderedStateCommandId) return;
+  lastRenderedStateCommandId = stateCommandId;
+
+  const clientClick = Number(command.client_perf_click_ms);
+  const browserRenderDeltaMs = Number.isFinite(clientClick) ? renderStartedMs - clientClick : null;
+  const firmware = state.firmware || {};
+  const firmwareCommandToSampleMs = Number(firmware.firmware_switch_sampled_ms || 0) - Number(firmware.firmware_command_received_ms || 0);
+  const firmwareSampleToPublishMs = Number(firmware.firmware_state_publish_started_ms || 0) - Number(firmware.firmware_switch_sampled_ms || 0);
+  const row = {
+    source,
+    command_id: stateCommandId,
+    browser_click_to_render_ms: browserRenderDeltaMs === null ? "n/a" : Math.round(browserRenderDeltaMs),
+    api_to_publish_ms: command.server_mqtt_publish_ts_ms && command.server_api_received_ts_ms ? Math.round(command.server_mqtt_publish_ts_ms - command.server_api_received_ts_ms) : "n/a",
+    firmware_command_to_sample_ms: Number.isFinite(firmwareCommandToSampleMs) ? firmwareCommandToSampleMs : "n/a",
+    firmware_sample_to_publish_ms: Number.isFinite(firmwareSampleToPublishMs) ? firmwareSampleToPublishMs : "n/a",
+    state_payload_bytes: state.payload_bytes || "n/a",
+  };
+  console.table([row]);
+  setDebug(`Rendered ${stateCommandId}: ${row.browser_click_to_render_ms}ms, payload ${row.state_payload_bytes}B`);
+}
+
+function render(snapshot, source = "render") {
   if (!snapshot) return;
-  latest = snapshot;
+  const renderStartedMs = performance.now();
+  latest = reconcileSnapshot(snapshot);
 
   const outputs = latestOutputs();
   setPill(
@@ -322,15 +385,32 @@ function render(snapshot) {
   els.switchPanels.forEach((panel) => {
     syncSwitchPanel(panel, switchTests[panel.dataset.switchChannel]);
   });
+  summarizeLatency(snapshot, renderStartedMs, source);
 }
 
 function send(command) {
-  console.debug("[lv-test-plate] command payload being sent", command);
+  const clickPerfMs = performance.now();
+  const clickTsMs = Date.now();
+  clientCommandSeq += 1;
+  const payload = {
+    command_id: command.command_id || commandId(),
+    client_command_seq: clientCommandSeq,
+    client_click_ts_ms: clickTsMs,
+    client_perf_click_ms: clickPerfMs,
+    ...command,
+  };
+  console.info("[lv-test-plate] browser command click", {
+    command_id: payload.command_id,
+    client_command_seq: payload.client_command_seq,
+    client_click_ts_ms: clickTsMs,
+    client_perf_click_ms: clickPerfMs,
+    command: payload,
+  });
   els.message.textContent = "Sending command...";
   return fetch("/api/command", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(command),
+    body: JSON.stringify(payload),
   }).then(async (response) => {
     if (!response.ok) {
       const error = await response.text();
@@ -338,7 +418,7 @@ function send(command) {
     }
     return response.json();
   }).then((result) => {
-    if (result.snapshot) render(result.snapshot);
+    if (result.snapshot) render(result.snapshot, "command_sent");
     els.message.textContent = "Command published.";
     return result;
   });
@@ -353,7 +433,13 @@ function sendSetOutputs(changes) {
 
 function sendSwitchConfig(panel) {
   const channel = panel.dataset.switchChannel;
-  return send({ switch_tests: { [channel]: collectSwitchConfig(panel) } }).catch((error) => {
+  const config = collectSwitchConfig(panel);
+  if (config.enabled && (config.pin === null || config.pin < 0)) {
+    els.message.textContent = "Select an input pin before enabling this switch channel.";
+    render(latest, "invalid_switch_config");
+    return Promise.resolve();
+  }
+  return send({ switch_tests: { [channel]: config } }).catch((error) => {
     els.message.textContent = `Switch config failed: ${error.message}`;
   });
 }
@@ -445,7 +531,7 @@ fetch("/api/state")
   .then((response) => response.json())
   .then((snapshot) => {
     setDebug(`Initial state loaded (${APP_JS_VERSION})`);
-    render(snapshot);
+    render(snapshot, "initial_state");
   })
   .catch((error) => {
     els.message.textContent = `Initial state failed: ${error.message}`;
@@ -465,7 +551,7 @@ function connectWebSocket() {
     console.debug("[lv-test-plate] incoming WebSocket message", message.type, message);
     setDebug(`WebSocket message: ${message.type}${message.topic_key ? ` (${message.topic_key})` : ""}`);
     if (message.type === "snapshot" || message.type === "mqtt_message" || message.type === "command_sent") {
-      render(message.data);
+      render(message.data, message.type);
     }
   });
 
