@@ -1,4 +1,4 @@
-const APP_JS_VERSION = "switch-tests-2026-05-28-2";
+const APP_JS_VERSION = "capabilities-2026-05-29-1";
 
 const DEFAULT_OUTPUTS = {
   relay_1: false,
@@ -113,6 +113,9 @@ function latestSwitchTests() {
 }
 
 function pinOptions() {
+  if (Array.isArray(latest?.capabilities?.switch_input_pin_options) && latest.capabilities.switch_input_pin_options.length > 0) {
+    return latest.capabilities.switch_input_pin_options;
+  }
   return Array.isArray(latest?.switch_input_pin_options) ? latest.switch_input_pin_options : [];
 }
 

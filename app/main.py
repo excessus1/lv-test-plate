@@ -55,6 +55,7 @@ class Settings:
         return {
             "cmd": f"{base}/cmd",
             "state": f"{base}/state",
+            "capabilities": f"{base}/capabilities",
             "telemetry": f"{base}/telemetry",
             "status": f"{base}/status",
         }
@@ -85,6 +86,7 @@ class DashboardState:
                 "pwm_value": 0,
             },
             "switch_tests": _default_switch_tests(),
+            "capabilities": _default_capabilities(),
             "switch_input_pin_options": [],
             "telemetry": {
                 "uptime_ms": None,
@@ -97,6 +99,7 @@ class DashboardState:
             "last_command": None,
             "messages": {
                 "state": None,
+                "capabilities": None,
                 "telemetry": None,
                 "status": None,
             },
@@ -167,12 +170,22 @@ class DashboardState:
                     _merge_switch_tests(self._state["switch_tests"], switch_tests)
                 pin_options = payload.get("switch_input_pin_options")
                 if isinstance(pin_options, list):
-                    self._state["switch_input_pin_options"] = _coerce_pin_options(pin_options)
+                    coerced_pin_options = _coerce_pin_options(pin_options)
+                    if not self._state["capabilities"].get("switch_input_pin_options"):
+                        self._state["switch_input_pin_options"] = coerced_pin_options
+                        self._state["capabilities"]["switch_input_pin_options"] = coerced_pin_options
+                        self._state["capabilities"]["source"] = "state"
                 if "last_command" in payload:
                     self._state["last_command"] = payload["last_command"]
                 elif "last_command_received" in payload:
                     self._state["last_command"] = payload["last_command_received"]
                 self._state["telemetry"]["uptime_ms"] = payload.get("uptime_ms", self._state["telemetry"]["uptime_ms"])
+            elif topic_key == "capabilities" and isinstance(payload, dict):
+                capabilities = _coerce_capabilities(payload, now)
+                self._state["capabilities"].update(capabilities)
+                pin_options = capabilities.get("switch_input_pin_options")
+                if isinstance(pin_options, list):
+                    self._state["switch_input_pin_options"] = pin_options
             elif topic_key == "telemetry" and isinstance(payload, dict):
                 self._state["telemetry"].update(
                     {
@@ -267,6 +280,20 @@ def _default_switch_tests() -> dict[str, dict[str, Any]]:
     }
 
 
+def _default_capabilities() -> dict[str, Any]:
+    return {
+        "sketch": None,
+        "firmware_version": None,
+        "supported_switch_modes": [],
+        "supported_pull_modes": [],
+        "output_pins": {},
+        "input_pins": {},
+        "switch_input_pin_options": [],
+        "source": None,
+        "last_received_at": None,
+    }
+
+
 def _coerce_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
@@ -329,6 +356,59 @@ def _coerce_pin_options(raw: list[Any]) -> list[dict[str, Any]]:
             continue
         options.append({"pin": pin, "label": str(item.get("label") or f"D{pin}")})
     return options
+
+
+def _coerce_pin_descriptor(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict) or "pin" not in raw:
+        return None
+    pin = _coerce_int(raw["pin"], -1, -1, 100)
+    if pin < 0:
+        return None
+    return {"pin": pin, "label": str(raw.get("label") or f"D{pin}")}
+
+
+def _coerce_pin_map(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    pins: dict[str, dict[str, Any]] = {}
+    for key, value in raw.items():
+        descriptor = _coerce_pin_descriptor(value)
+        if descriptor is not None:
+            pins[str(key)] = descriptor
+    return pins
+
+
+def _coerce_capability_modes(raw: Any, allowed: set[str]) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    modes: list[str] = []
+    for item in raw:
+        value = str(item)
+        if value in allowed and value not in modes:
+            modes.append(value)
+    return modes
+
+
+def _coerce_capabilities(raw: dict[str, Any], received_at: float) -> dict[str, Any]:
+    capabilities: dict[str, Any] = {
+        "source": "capabilities",
+        "last_received_at": received_at,
+    }
+    if "sketch" in raw:
+        capabilities["sketch"] = str(raw["sketch"])
+    if "firmware_version" in raw:
+        capabilities["firmware_version"] = str(raw["firmware_version"])
+    if isinstance(raw.get("switch_input_pin_options"), list):
+        capabilities["switch_input_pin_options"] = _coerce_pin_options(raw["switch_input_pin_options"])
+    if isinstance(raw.get("supported_switch_modes"), list):
+        capabilities["supported_switch_modes"] = _coerce_capability_modes(raw["supported_switch_modes"], SWITCH_MODES)
+    if isinstance(raw.get("supported_pull_modes"), list):
+        capabilities["supported_pull_modes"] = _coerce_capability_modes(raw["supported_pull_modes"], SWITCH_PULL_MODES)
+    if isinstance(raw.get("output_pins"), dict):
+        capabilities["output_pins"] = _coerce_pin_map(raw["output_pins"])
+    if isinstance(raw.get("input_pins"), dict):
+        capabilities["input_pins"] = _coerce_pin_map(raw["input_pins"])
+    return capabilities
 
 
 def _parse_payload(payload: bytes) -> Any:
@@ -413,7 +493,7 @@ def _make_mqtt_client() -> mqtt.Client:
         logger.info("MQTT connect result: %s", reason_code)
         snapshot = state.update_app(mqtt_connected=connected, last_error=None if connected else str(reason_code))
         if connected:
-            for topic_key in ("state", "telemetry", "status"):
+            for topic_key in ("state", "capabilities", "telemetry", "status"):
                 topic = settings.topics[topic_key]
                 client.subscribe(topic)
                 logger.info("Subscribed to MQTT topic %s", topic)

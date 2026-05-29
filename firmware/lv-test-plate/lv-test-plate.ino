@@ -15,6 +15,11 @@ const int RELAY_2_PIN = 13;      // D13, digital relay output
 const int SSR_1_PIN = 3;         // D3, SSR output
 const int PWM_PIN = 5;           // D5, PWM-capable output
 const int POT_PIN = A0;          // A0, analog potentiometer input
+const char* RELAY_1_PIN_LABEL = "D8";
+const char* RELAY_2_PIN_LABEL = "D13";
+const char* SSR_1_PIN_LABEL = "D3";
+const char* PWM_PIN_LABEL = "D5";
+const char* POT_PIN_LABEL = "A0";
 
 // Output polarity. Relay modules and SSRs often use different active levels.
 const int RELAY_ON_LEVEL = LOW;
@@ -23,7 +28,7 @@ const int SSR_ON_LEVEL = HIGH;
 const int SSR_OFF_LEVEL = LOW;
 
 // Switch-test input options are defined here with the active pin map above.
-// The web UI reads these from firmware state instead of relying on README pin notes.
+// The web UI reads these from firmware capabilities instead of relying on README pin notes.
 const int NO_SWITCH_PIN = -1;
 const int SWITCH_INPUT_PIN_OPTIONS[] = {2, 4, 6, 7, 9, 10, 11, 12, A1, A2, A3, A4, A5};
 const char* SWITCH_INPUT_PIN_LABELS[] = {"D2", "D4", "D6", "D7", "D9", "D10", "D11", "D12", "A1", "A2", "A3", "A4", "A5"};
@@ -36,13 +41,27 @@ const unsigned long DEFAULT_SWITCH_SETTLE_MS = 150;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long STATE_PUBLISH_INTERVAL_MS = 5000;
 const unsigned long TELEMETRY_PUBLISH_INTERVAL_MS = 2000;
-const size_t STATE_JSON_CAPACITY = 4096;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
+const unsigned long MQTT_POLL_DIAGNOSTIC_INTERVAL_MS = 5000;
+const char* SKETCH_ID = "lv-test-plate";
+const char* FIRMWARE_VERSION = "2026-05-29-stability-1";
+const size_t STATE_JSON_CAPACITY = 3072;
+const size_t CAPABILITIES_JSON_CAPACITY = 1536;
+
+#ifndef LVTP_ENABLE_CAPABILITIES_PUBLISH
+#define LVTP_ENABLE_CAPABILITIES_PUBLISH 0
+#endif
+
+#ifndef LVTP_ENABLE_FULL_SWITCH_TEST_STATE
+#define LVTP_ENABLE_FULL_SWITCH_TEST_STATE 0
+#endif
 
 WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
 
 String cmdTopic;
 String stateTopic;
+String capabilitiesTopic;
 String telemetryTopic;
 String statusTopic;
 
@@ -89,18 +108,47 @@ struct SwitchTestResult {
   SwitchReading before;
   SwitchReading after;
   unsigned long settleMs = DEFAULT_SWITCH_SETTLE_MS;
-  String status = "not_run";
+  const char* status = "not_run";
 };
 
 Outputs outputs;
 SwitchConfig switchConfigs[SWITCH_CHANNEL_COUNT];
 SwitchReading switchReadings[SWITCH_CHANNEL_COUNT];
 SwitchTestResult switchResults[SWITCH_CHANNEL_COUNT];
-String lastCommandSummary = "";
+char lastCommandSummaryBuffer[96] = "";
 unsigned long lastMqttAttempt = 0;
+unsigned long lastWifiAttempt = 0;
 unsigned long lastStatePublish = 0;
 unsigned long lastTelemetryPublish = 0;
+unsigned long lastPollDiagnostic = 0;
 bool mqttWasConnected = false;
+bool wifiWasConnected = false;
+bool stateDirty = true;
+
+void setLastCommandSummary(const char* value) {
+  snprintf(lastCommandSummaryBuffer, sizeof(lastCommandSummaryBuffer), "%s", value);
+  stateDirty = true;
+}
+
+void setLastCommandSummary2(const char* prefix, const char* value) {
+  snprintf(lastCommandSummaryBuffer, sizeof(lastCommandSummaryBuffer), "%s%s", prefix, value);
+  stateDirty = true;
+}
+
+void printResetDiagnostics() {
+  Serial.print("setup reset_status");
+#if defined(R_SYSTEM)
+  Serial.print(" RSTSR0=0x");
+  Serial.print((uint8_t)R_SYSTEM->RSTSR0, HEX);
+  Serial.print(" RSTSR1=0x");
+  Serial.print((uint16_t)R_SYSTEM->RSTSR1, HEX);
+  Serial.print(" RSTSR2=0x");
+  Serial.print((uint8_t)R_SYSTEM->RSTSR2, HEX);
+#else
+  Serial.print(" unavailable");
+#endif
+  Serial.println();
+}
 
 void applyOutputs() {
   digitalWrite(RELAY_1_PIN, outputs.relay1 ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
@@ -322,10 +370,71 @@ void runSwitchTest(size_t index) {
   switchResults[index] = result;
 }
 
-void publishText(const String& topic, const char* text, bool retained) {
-  mqttClient.beginMessage(topic.c_str(), retained);
-  mqttClient.print(text);
-  mqttClient.endMessage();
+bool publishText(const char* label, const String& topic, const char* text, bool retained) {
+  const size_t payloadSize = strlen(text);
+  Serial.print(label);
+  Serial.print(" payload_len=");
+  Serial.print(payloadSize);
+
+  const int beginOk = mqttClient.beginMessage(topic.c_str(), (unsigned long)payloadSize, retained);
+  size_t mqttBytesWritten = 0;
+  int endOk = 0;
+  if (beginOk) {
+    mqttBytesWritten = mqttClient.print(text);
+    endOk = mqttClient.endMessage();
+  }
+
+  Serial.print(" mqtt_begin=");
+  Serial.print(beginOk);
+  Serial.print(" mqtt_written=");
+  Serial.print(mqttBytesWritten);
+  Serial.print(" mqtt_end=");
+  Serial.println(endOk);
+  if (!beginOk || !endOk || mqttBytesWritten != payloadSize) {
+    Serial.print(label);
+    Serial.println(" ERROR: MQTT publish did not write the full payload");
+    return false;
+  }
+  return true;
+}
+
+template <typename TDocument>
+bool publishJsonDocument(const char* label, const String& topic, bool retained, TDocument& doc, size_t capacity) {
+  const size_t measuredJsonSize = measureJson(doc);
+  const bool jsonOverflowed = doc.overflowed();
+  Serial.print(label);
+  Serial.print(" json_capacity=");
+  Serial.print(capacity);
+  Serial.print(" measured=");
+  Serial.print(measuredJsonSize);
+  Serial.print(" overflowed=");
+  Serial.println(jsonOverflowed ? "true" : "false");
+  if (jsonOverflowed) {
+    Serial.print(label);
+    Serial.println(" ERROR: ArduinoJson overflowed; payload is incomplete");
+  }
+
+  const int beginOk = mqttClient.beginMessage(topic.c_str(), (unsigned long)measuredJsonSize, retained);
+  size_t mqttBytesWritten = 0;
+  int endOk = 0;
+  if (beginOk) {
+    mqttBytesWritten = serializeJson(doc, mqttClient);
+    endOk = mqttClient.endMessage();
+  }
+
+  Serial.print(label);
+  Serial.print(" mqtt_begin=");
+  Serial.print(beginOk);
+  Serial.print(" mqtt_written=");
+  Serial.print(mqttBytesWritten);
+  Serial.print(" mqtt_end=");
+  Serial.println(endOk);
+  if (!beginOk || !endOk || mqttBytesWritten != measuredJsonSize) {
+    Serial.print(label);
+    Serial.println(" ERROR: MQTT publish did not write the full payload");
+    return false;
+  }
+  return !jsonOverflowed;
 }
 
 void writeSwitchReading(JsonObject target, const SwitchReading& reading) {
@@ -350,6 +459,47 @@ void writeSwitchTestResult(JsonObject target, const SwitchTestResult& result) {
   writeSwitchReading(after, result.after);
 }
 
+void writePinDescriptor(JsonObject target, int pin, const char* label) {
+  target["pin"] = pin;
+  target["label"] = label;
+}
+
+void writeSwitchInputPinOptions(JsonArray pinOptions) {
+  for (size_t i = 0; i < SWITCH_INPUT_PIN_COUNT; i++) {
+    JsonObject option = pinOptions.createNestedObject();
+    writePinDescriptor(option, SWITCH_INPUT_PIN_OPTIONS[i], SWITCH_INPUT_PIN_LABELS[i]);
+  }
+}
+
+void publishCapabilities() {
+  StaticJsonDocument<CAPABILITIES_JSON_CAPACITY> doc;
+  doc["sketch"] = SKETCH_ID;
+  doc["firmware_version"] = FIRMWARE_VERSION;
+
+  JsonArray switchModes = doc.createNestedArray("supported_switch_modes");
+  switchModes.add("NO");
+  switchModes.add("NC");
+
+  JsonArray pullModes = doc.createNestedArray("supported_pull_modes");
+  pullModes.add("pullup");
+  pullModes.add("pulldown");
+  pullModes.add("external");
+
+  JsonObject outputPins = doc.createNestedObject("output_pins");
+  writePinDescriptor(outputPins.createNestedObject("relay_1"), RELAY_1_PIN, RELAY_1_PIN_LABEL);
+  writePinDescriptor(outputPins.createNestedObject("relay_2"), RELAY_2_PIN, RELAY_2_PIN_LABEL);
+  writePinDescriptor(outputPins.createNestedObject("ssr_1"), SSR_1_PIN, SSR_1_PIN_LABEL);
+  writePinDescriptor(outputPins.createNestedObject("pwm"), PWM_PIN, PWM_PIN_LABEL);
+
+  JsonObject inputPins = doc.createNestedObject("input_pins");
+  writePinDescriptor(inputPins.createNestedObject("pot"), POT_PIN, POT_PIN_LABEL);
+
+  JsonArray pinOptions = doc.createNestedArray("switch_input_pin_options");
+  writeSwitchInputPinOptions(pinOptions);
+
+  publishJsonDocument("publishCapabilities", capabilitiesTopic, true, doc, CAPABILITIES_JSON_CAPACITY);
+}
+
 void writeSwitchChannel(JsonObject target, size_t index) {
   SwitchConfig& config = switchConfigs[index];
   target["enabled"] = config.enabled;
@@ -369,7 +519,24 @@ void writeSwitchChannel(JsonObject target, size_t index) {
   writeSwitchTestResult(lastTest, switchResults[index]);
 }
 
-void publishState(bool retained) {
+bool shouldIncludeSwitchTests(bool forceSwitchTests) {
+#if LVTP_ENABLE_FULL_SWITCH_TEST_STATE
+  (void)forceSwitchTests;
+  return true;
+#else
+  if (forceSwitchTests) {
+    return true;
+  }
+  for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
+    if (switchConfigs[i].enabled || switchReadings[i].configured || switchResults[i].available) {
+      return true;
+    }
+  }
+  return false;
+#endif
+}
+
+void publishState(bool retained, bool forceSwitchTests = false) {
   StaticJsonDocument<STATE_JSON_CAPACITY> doc;
   JsonObject out = doc.createNestedObject("outputs");
   out["relay_1"] = outputs.relay1;
@@ -378,57 +545,21 @@ void publishState(bool retained) {
   out["pwm_enabled"] = outputs.pwmEnabled;
   out["pwm_value"] = outputs.pwmValue;
 
-  JsonObject switchTests = doc.createNestedObject("switch_tests");
-  for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
-    JsonObject channel = switchTests.createNestedObject(SWITCH_CHANNEL_KEYS[i]);
-    writeSwitchChannel(channel, i);
-  }
-
-  JsonArray pinOptions = doc.createNestedArray("switch_input_pin_options");
-  for (size_t i = 0; i < SWITCH_INPUT_PIN_COUNT; i++) {
-    JsonObject option = pinOptions.createNestedObject();
-    option["pin"] = SWITCH_INPUT_PIN_OPTIONS[i];
-    option["label"] = SWITCH_INPUT_PIN_LABELS[i];
+  const bool includeSwitchTests = shouldIncludeSwitchTests(forceSwitchTests);
+  if (includeSwitchTests) {
+    JsonObject switchTests = doc.createNestedObject("switch_tests");
+    for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
+      JsonObject channel = switchTests.createNestedObject(SWITCH_CHANNEL_KEYS[i]);
+      writeSwitchChannel(channel, i);
+    }
   }
 
   doc["uptime_ms"] = millis();
-  doc["last_command"] = lastCommandSummary;
+  doc["last_command"] = lastCommandSummaryBuffer;
+  doc["switch_tests_included"] = includeSwitchTests;
 
-  String payload;
-  const size_t measuredJsonSize = measureJson(doc);
-  const size_t serializedJsonSize = serializeJson(doc, payload);
-  const bool jsonOverflowed = doc.overflowed();
-
-  Serial.print("publishState json_capacity=");
-  Serial.print(STATE_JSON_CAPACITY);
-  Serial.print(" measured=");
-  Serial.print(measuredJsonSize);
-  Serial.print(" serialized=");
-  Serial.print(serializedJsonSize);
-  Serial.print(" payload_len=");
-  Serial.print(payload.length());
-  Serial.print(" overflowed=");
-  Serial.println(jsonOverflowed ? "true" : "false");
-  if (jsonOverflowed) {
-    Serial.println("publishState ERROR: ArduinoJson overflowed; state payload is incomplete");
-  }
-
-  const int beginOk = mqttClient.beginMessage(stateTopic.c_str(), (unsigned long)payload.length(), retained);
-  size_t mqttBytesWritten = 0;
-  int endOk = 0;
-  if (beginOk) {
-    mqttBytesWritten = mqttClient.print(payload);
-    endOk = mqttClient.endMessage();
-  }
-
-  Serial.print("publishState mqtt_begin=");
-  Serial.print(beginOk);
-  Serial.print(" mqtt_written=");
-  Serial.print(mqttBytesWritten);
-  Serial.print(" mqtt_end=");
-  Serial.println(endOk);
-  if (!beginOk || !endOk || mqttBytesWritten != payload.length()) {
-    Serial.println("publishState ERROR: MQTT state publish did not write the full payload");
+  if (publishJsonDocument("publishState", stateTopic, retained, doc, STATE_JSON_CAPACITY)) {
+    stateDirty = false;
   }
 }
 
@@ -440,40 +571,42 @@ void publishTelemetry() {
   doc["wifi_connected"] = WiFi.status() == WL_CONNECTED;
   doc["mqtt_connected"] = mqttClient.connected();
 
-  String payload;
-  serializeJson(doc, payload);
-  mqttClient.beginMessage(telemetryTopic.c_str(), false);
-  mqttClient.print(payload);
-  mqttClient.endMessage();
+  publishJsonDocument("publishTelemetry", telemetryTopic, false, doc, 256);
 }
 
 void updateLastCommandSummary(const JsonObject& out) {
-  String summary = "";
+  char summary[96] = "";
+  size_t used = 0;
+
+#define APPEND_SUMMARY_PART(label, value) \
+  do { \
+    int written = snprintf(summary + used, sizeof(summary) - used, "%s%s%s", used > 0 ? " " : "", label, value); \
+    if (written > 0) { \
+      used += (size_t)written; \
+      if (used >= sizeof(summary)) used = sizeof(summary) - 1; \
+    } \
+  } while (0)
+
   if (out.containsKey("relay_1")) {
-    summary += "relay_1:";
-    summary += outputs.relay1 ? "on" : "off";
+    APPEND_SUMMARY_PART("relay_1:", outputs.relay1 ? "on" : "off");
   }
   if (out.containsKey("relay_2")) {
-    if (summary.length() > 0) summary += " ";
-    summary += "relay_2:";
-    summary += outputs.relay2 ? "on" : "off";
+    APPEND_SUMMARY_PART("relay_2:", outputs.relay2 ? "on" : "off");
   }
   if (out.containsKey("ssr_1")) {
-    if (summary.length() > 0) summary += " ";
-    summary += "ssr_1:";
-    summary += outputs.ssr1 ? "on" : "off";
+    APPEND_SUMMARY_PART("ssr_1:", outputs.ssr1 ? "on" : "off");
   }
   if (out.containsKey("pwm_enabled")) {
-    if (summary.length() > 0) summary += " ";
-    summary += "pwm_enabled:";
-    summary += outputs.pwmEnabled ? "on" : "off";
+    APPEND_SUMMARY_PART("pwm_enabled:", outputs.pwmEnabled ? "on" : "off");
   }
   if (out.containsKey("pwm_value")) {
-    if (summary.length() > 0) summary += " ";
-    summary += "pwm:";
-    summary += outputs.pwmValue;
+    char pwmValue[8];
+    snprintf(pwmValue, sizeof(pwmValue), "%d", outputs.pwmValue);
+    APPEND_SUMMARY_PART("pwm:", pwmValue);
   }
-  lastCommandSummary = summary.length() > 0 ? summary : "outputs";
+  setLastCommandSummary(used > 0 ? summary : "outputs");
+
+#undef APPEND_SUMMARY_PART
 }
 
 bool updateSwitchConfig(size_t index, JsonObject configDoc) {
@@ -536,23 +669,40 @@ bool updateSwitchConfigs(JsonObject switchTests) {
 }
 
 void handleCommand(int messageSize) {
-  String payload;
+  Serial.print("handleCommand message_size=");
+  Serial.println(messageSize);
+
+  char payload[1537];
+  size_t payloadLength = 0;
+  while (mqttClient.available() && payloadLength < sizeof(payload) - 1) {
+    int next = mqttClient.read();
+    if (next < 0) {
+      break;
+    }
+    payload[payloadLength++] = (char)next;
+  }
+  payload[payloadLength] = '\0';
+  if (messageSize >= (int)sizeof(payload)) {
+    Serial.println("handleCommand WARNING: payload truncated to command buffer size");
+  }
   while (mqttClient.available()) {
-    payload += (char)mqttClient.read();
+    mqttClient.read();
   }
 
   StaticJsonDocument<1536> doc;
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
-    lastCommandSummary = "invalid_json";
-    publishState(true);
+    Serial.print("handleCommand invalid_json error=");
+    Serial.println(error.c_str());
+    setLastCommandSummary("invalid_json");
+    publishState(true, true);
     return;
   }
 
   bool handled = false;
   JsonObject switchTests = doc["switch_tests"];
   if (updateSwitchConfigs(switchTests)) {
-    lastCommandSummary = "switch_config";
+    setLastCommandSummary("switch_config");
     handled = true;
   }
 
@@ -572,10 +722,9 @@ void handleCommand(int messageSize) {
     int index = switchChannelIndex(channel);
     if (index >= 0) {
       readSwitch((size_t)index);
-      lastCommandSummary = "switch_read:";
-      lastCommandSummary += SWITCH_CHANNEL_KEYS[index];
+      setLastCommandSummary2("switch_read:", SWITCH_CHANNEL_KEYS[index]);
     } else {
-      lastCommandSummary = "switch_read:invalid_channel";
+      setLastCommandSummary("switch_read:invalid_channel");
     }
     handled = true;
   }
@@ -585,33 +734,53 @@ void handleCommand(int messageSize) {
     int index = switchChannelIndex(channel);
     if (index >= 0) {
       runSwitchTest((size_t)index);
-      lastCommandSummary = "switch_test:";
-      lastCommandSummary += SWITCH_CHANNEL_KEYS[index];
+      setLastCommandSummary2("switch_test:", SWITCH_CHANNEL_KEYS[index]);
     } else {
-      lastCommandSummary = "switch_test:invalid_channel";
+      setLastCommandSummary("switch_test:invalid_channel");
     }
     handled = true;
   }
 
   if (!handled) {
-    lastCommandSummary = "no_command";
+    setLastCommandSummary("no_command");
   }
 
   applyOutputs();
-  publishState(true);
+  publishState(true, true);
 }
 
 void connectWifi() {
-  if (WiFi.status() == WL_CONNECTED) {
+  int wifiStatus = WiFi.status();
+  if (wifiStatus == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      Serial.print("WiFi connected ip=");
+      Serial.print(WiFi.localIP());
+      Serial.print(" rssi=");
+      Serial.println(WiFi.RSSI());
+      wifiWasConnected = true;
+    }
     return;
   }
 
-  Serial.print("Connecting to WiFi");
-  while (WiFi.begin(WIFI_SSID, WIFI_PASSWORD) != WL_CONNECTED) {
-    Serial.print(".");
-    delay(3000);
+  if (wifiWasConnected) {
+    Serial.print("WiFi disconnected status=");
+    Serial.println(wifiStatus);
+    wifiWasConnected = false;
   }
-  Serial.println(" connected");
+
+  unsigned long now = millis();
+  if (now - lastWifiAttempt < WIFI_RECONNECT_INTERVAL_MS) {
+    return;
+  }
+  lastWifiAttempt = now;
+
+  Serial.print("Connecting to WiFi status=");
+  Serial.print(wifiStatus);
+  Serial.print(" uptime_ms=");
+  Serial.println(now);
+  int beginStatus = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi begin result=");
+  Serial.println(beginStatus);
 }
 
 void connectMqtt() {
@@ -625,20 +794,39 @@ void connectMqtt() {
   }
   lastMqttAttempt = now;
 
+  int wifiStatus = WiFi.status();
+  if (wifiStatus != WL_CONNECTED) {
+    Serial.print("MQTT connect skipped; wifi_status=");
+    Serial.print(wifiStatus);
+    Serial.print(" uptime_ms=");
+    Serial.println(now);
+    return;
+  }
+
   Serial.print("Connecting to MQTT ");
   Serial.print(MQTT_HOST);
   Serial.print(":");
-  Serial.println(MQTT_PORT);
+  Serial.print(MQTT_PORT);
+  Serial.print(" uptime_ms=");
+  Serial.println(now);
 
   if (mqttClient.connect(MQTT_HOST, MQTT_PORT)) {
-    Serial.println("MQTT connected");
+    Serial.print("MQTT connected subscribed_cmd=");
     mqttWasConnected = true;
-    publishText(statusTopic, "online", true);
-    mqttClient.subscribe(cmdTopic.c_str());
+    int subscribeOk = mqttClient.subscribe(cmdTopic.c_str());
+    Serial.println(subscribeOk);
+    publishText("publishStatus", statusTopic, "online", true);
+#if LVTP_ENABLE_CAPABILITIES_PUBLISH
+    publishCapabilities();
+#else
+    Serial.println("publishCapabilities disabled by LVTP_ENABLE_CAPABILITIES_PUBLISH=0");
+#endif
     publishState(true);
   } else {
     Serial.print("MQTT failed, error ");
-    Serial.println(mqttClient.connectError());
+    Serial.print(mqttClient.connectError());
+    Serial.print(" wifi_status=");
+    Serial.println(wifiStatus);
   }
 }
 
@@ -650,6 +838,7 @@ void setupTopics() {
   }
   cmdTopic = base + "/cmd";
   stateTopic = base + "/state";
+  capabilitiesTopic = base + "/capabilities";
   telemetryTopic = base + "/telemetry";
   statusTopic = base + "/status";
 }
@@ -657,6 +846,18 @@ void setupTopics() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  Serial.println();
+  Serial.print("setup start sketch=");
+  Serial.print(SKETCH_ID);
+  Serial.print(" firmware=");
+  Serial.print(FIRMWARE_VERSION);
+  Serial.print(" uptime_ms=");
+  Serial.println(millis());
+  printResetDiagnostics();
+  Serial.print("feature capabilities_publish=");
+  Serial.print(LVTP_ENABLE_CAPABILITIES_PUBLISH);
+  Serial.print(" full_switch_test_state=");
+  Serial.println(LVTP_ENABLE_FULL_SWITCH_TEST_STATE);
 
   pinMode(RELAY_1_PIN, OUTPUT);
   pinMode(RELAY_2_PIN, OUTPUT);
@@ -679,6 +880,7 @@ void setup() {
   mqttClient.onMessage(handleCommand);
 
   connectMqtt();
+  Serial.println("setup complete");
 }
 
 void loop() {
@@ -686,9 +888,15 @@ void loop() {
 
   if (!mqttClient.connected()) {
     if (mqttWasConnected) {
-      Serial.println("MQTT disconnected; forcing outputs off");
+      Serial.print("MQTT disconnected; forcing outputs off uptime_ms=");
+      Serial.print(millis());
+      Serial.print(" wifi_status=");
+      Serial.print(WiFi.status());
+      Serial.print(" connect_error=");
+      Serial.println(mqttClient.connectError());
       allOutputsOff();
       mqttWasConnected = false;
+      stateDirty = true;
     }
     connectMqtt();
   }
@@ -696,11 +904,22 @@ void loop() {
   mqttClient.poll();
 
   unsigned long now = millis();
+  if (now - lastPollDiagnostic >= MQTT_POLL_DIAGNOSTIC_INTERVAL_MS) {
+    lastPollDiagnostic = now;
+    Serial.print("mqttPoll uptime_ms=");
+    Serial.print(now);
+    Serial.print(" mqtt_connected=");
+    Serial.print(mqttClient.connected());
+    Serial.print(" wifi_status=");
+    Serial.print(WiFi.status());
+    Serial.print(" state_dirty=");
+    Serial.println(stateDirty);
+  }
   if (mqttClient.connected() && now - lastTelemetryPublish >= TELEMETRY_PUBLISH_INTERVAL_MS) {
     lastTelemetryPublish = now;
     publishTelemetry();
   }
-  if (mqttClient.connected() && now - lastStatePublish >= STATE_PUBLISH_INTERVAL_MS) {
+  if (mqttClient.connected() && (stateDirty || now - lastStatePublish >= STATE_PUBLISH_INTERVAL_MS)) {
     lastStatePublish = now;
     publishState(true);
   }
