@@ -28,8 +28,9 @@ Arduino Uno R4 WiFi test plate
 Default topics use `MQTT_BASE_TOPIC=lv-test-plate`:
 
 - `lv-test-plate/cmd`: web app publishes non-retained output commands
-- `lv-test-plate/state`: board publishes retained dynamic output and switch-test state
+- `lv-test-plate/state`: board publishes retained dynamic output state and timing metadata
 - `lv-test-plate/capabilities`: board publishes retained static/semi-static board metadata
+- `lv-test-plate/switch`: board publishes retained compact per-channel switch config/read/test events
 - `lv-test-plate/telemetry`: board publishes periodic telemetry
 - `lv-test-plate/status`: board publishes retained `online`; MQTT last will publishes retained `offline`
 
@@ -85,7 +86,7 @@ or, from the host itself:
 http://localhost:8088/
 ```
 
-The app subscribes to the board `state`, `capabilities`, `telemetry`, and `status` topics, keeps the latest known values in memory, and serves live updates to the browser with a WebSocket.
+The app subscribes to the board `state`, `capabilities`, `switch`, `telemetry`, and `status` topics, keeps the latest known values in memory, and serves live updates to the browser with a WebSocket.
 
 ## Dashboard Controls
 
@@ -202,7 +203,7 @@ Board capabilities messages are retained static/semi-static board metadata. The 
 }
 ```
 
-Board state messages are retained dynamic state. Static board metadata such as `switch_input_pin_options` belongs on `lv-test-plate/capabilities`; the app still accepts that field in state for older firmware.
+Board state messages are retained dynamic output state. Static board metadata such as `switch_input_pin_options` belongs on `lv-test-plate/capabilities`; compact switch configuration/read/test results belong on `lv-test-plate/switch`. The app still accepts `switch_input_pin_options` and `switch_tests` in state for older firmware.
 
 ```json
 {
@@ -213,6 +214,20 @@ Board state messages are retained dynamic state. Static board metadata such as `
     "pwm_enabled": true,
     "pwm_value": 128
   },
+  "uptime_ms": 12000,
+  "last_command": "{\"outputs\":{\"relay_1\":true}}",
+  "switch_tests_included": false
+}
+```
+
+Switch event messages are retained compact per-channel updates. They echo `command_id` and monotonic `command_seq` so the app can ignore stale channel updates.
+
+```json
+{
+  "event": "switch_read",
+  "channel": "relay_2",
+  "command_id": "6c9418a7-9d3f-4a8e-9284-882b8dfb10d2",
+  "command_seq": 42,
   "switch_tests": {
     "relay_2": {
       "enabled": true,
@@ -259,8 +274,7 @@ Board state messages are retained dynamic state. Static board metadata such as `
       }
     }
   },
-  "uptime_ms": 12000,
-  "last_command": "{\"outputs\":{\"relay_1\":true}}"
+  "uptime_ms": 12000
 }
 ```
 
@@ -337,7 +351,7 @@ The default FQBN is `arduino:renesas_uno:unor4wifi`.
 scripts/compile-firmware.sh
 ```
 
-The firmware includes temporary stability isolation flags for MQTT payload debugging. By default, retained capabilities publishing and full idle `switch_tests` state are disabled in the sketch:
+The firmware includes temporary stability isolation flags for MQTT payload debugging. By default, retained capabilities publishing and full `switch_tests` payloads inside `lv-test-plate/state` are disabled in the sketch; compact per-channel switch updates still publish on `lv-test-plate/switch`.
 
 ```cpp
 #define LVTP_ENABLE_CAPABILITIES_PUBLISH 0

@@ -45,10 +45,13 @@ const unsigned long STATE_PUBLISH_INTERVAL_MS = 5000;
 const unsigned long TELEMETRY_PUBLISH_INTERVAL_MS = 2000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_POLL_DIAGNOSTIC_INTERVAL_MS = 5000;
+const unsigned long PUBLISH_WARN_MS = 100;
+const unsigned long LOOP_WARN_MS = 100;
 const char* SKETCH_ID = "lv-test-plate";
-const char* FIRMWARE_VERSION = "2026-05-29-ordered-switch-state-1";
+const char* FIRMWARE_VERSION = "2026-05-29-mqtt-responsive-switch-events-1";
 const size_t STATE_JSON_CAPACITY = 6144;
 const size_t CAPABILITIES_JSON_CAPACITY = 2048;
+const size_t SWITCH_EVENT_JSON_CAPACITY = 2048;
 
 #ifndef LVTP_ENABLE_CAPABILITIES_PUBLISH
 #define LVTP_ENABLE_CAPABILITIES_PUBLISH 0
@@ -66,6 +69,7 @@ String stateTopic;
 String capabilitiesTopic;
 String telemetryTopic;
 String statusTopic;
+String switchTopic;
 
 struct Outputs {
   bool relay1 = false;
@@ -153,12 +157,15 @@ unsigned long switchChannelSeq[SWITCH_CHANNEL_COUNT] = {0, 0};
 unsigned long lastCommandReceivedMs = 0;
 unsigned long lastSwitchSampledMs = 0;
 unsigned long lastStatePublishStartedMs = 0;
+unsigned long lastSwitchEventPublishStartedMs = 0;
 unsigned long lastMqttAttempt = 0;
 unsigned long lastWifiAttempt = 0;
 unsigned long lastStatePublish = 0;
 unsigned long lastTelemetryPublish = 0;
 unsigned long lastPollDiagnostic = 0;
 unsigned long lastSwitchService = 0;
+unsigned long lastLoopDurationMs = 0;
+bool switchEventDirty[SWITCH_CHANNEL_COUNT] = {false, false};
 bool mqttWasConnected = false;
 bool wifiWasConnected = false;
 bool stateDirty = true;
@@ -464,6 +471,7 @@ void startSwitchObservation(size_t index) {
 
   switchObservations[index] = observation;
   stateDirty = true;
+  switchEventDirty[index] = true;
 }
 
 void finishSwitchObservation(size_t index, const char* status) {
@@ -478,6 +486,7 @@ void finishSwitchObservation(size_t index, const char* status) {
   observation.status = status;
   switchChannelStatus[index] = status;
   stateDirty = true;
+  switchEventDirty[index] = true;
 }
 
 void serviceSwitchObservation(size_t index) {
@@ -501,10 +510,12 @@ void serviceSwitchObservation(size_t index) {
     }
     observation.lastClosed = reading.closed;
     stateDirty = true;
+    switchEventDirty[index] = true;
   } else if (reading.configured && !observation.hasLast) {
     observation.hasLast = true;
     observation.lastClosed = reading.closed;
     stateDirty = true;
+    switchEventDirty[index] = true;
   }
 
   unsigned long elapsed = millis() - observation.startedAt;
@@ -532,6 +543,7 @@ void serviceSwitchModes() {
         if (switchRelayOutput(i)) {
           setSwitchRelayOutput(i, false, "safety");
           stateDirty = true;
+          switchEventDirty[i] = true;
         }
         relayCommandedBy[i] = "safety";
         switchChannelStatus[i] = "relay_follow_not_configured";
@@ -543,9 +555,11 @@ void serviceSwitchModes() {
       if (wasOn != reading.closed) {
         setSwitchRelayOutput(i, reading.closed, "switch");
         stateDirty = true;
+        switchEventDirty[i] = true;
       }
       if (switchReadingChanged(before, reading)) {
         stateDirty = true;
+        switchEventDirty[i] = true;
       }
       switchChannelStatus[i] = "relay_following";
       continue;
@@ -558,6 +572,7 @@ void serviceSwitchModes() {
         SwitchReading reading = readSwitch(i);
         if (switchReadingChanged(before, reading)) {
           stateDirty = true;
+          switchEventDirty[i] = true;
         }
       }
       if (!switchObservations[i].active) {
@@ -572,6 +587,7 @@ void serviceSwitchModes() {
         SwitchReading reading = readSwitch(i);
         if (switchReadingChanged(before, reading)) {
           stateDirty = true;
+          switchEventDirty[i] = true;
         }
         switchChannelStatus[i] = "passive_read";
       } else {
@@ -627,6 +643,8 @@ bool publishText(const char* label, const String& topic, const char* text, bool 
   Serial.print(" payload_len=");
   Serial.print(payloadSize);
 
+  mqttClient.poll();
+  const unsigned long publishStarted = millis();
   const int beginOk = mqttClient.beginMessage(topic.c_str(), (unsigned long)payloadSize, retained);
   size_t mqttBytesWritten = 0;
   int endOk = 0;
@@ -634,13 +652,22 @@ bool publishText(const char* label, const String& topic, const char* text, bool 
     mqttBytesWritten = mqttClient.print(text);
     endOk = mqttClient.endMessage();
   }
+  const unsigned long publishDuration = millis() - publishStarted;
+  mqttClient.poll();
 
   Serial.print(" mqtt_begin=");
   Serial.print(beginOk);
   Serial.print(" mqtt_written=");
   Serial.print(mqttBytesWritten);
   Serial.print(" mqtt_end=");
-  Serial.println(endOk);
+  Serial.print(endOk);
+  Serial.print(" duration_ms=");
+  Serial.println(publishDuration);
+  if (publishDuration > PUBLISH_WARN_MS) {
+    Serial.print(label);
+    Serial.print(" WARNING: publish duration_ms=");
+    Serial.println(publishDuration);
+  }
   if (!beginOk || !endOk || mqttBytesWritten != payloadSize) {
     Serial.print(label);
     Serial.println(" ERROR: MQTT publish did not write the full payload");
@@ -665,6 +692,8 @@ bool publishJsonDocument(const char* label, const String& topic, bool retained, 
     Serial.println(" ERROR: ArduinoJson overflowed; payload is incomplete");
   }
 
+  mqttClient.poll();
+  const unsigned long publishStarted = millis();
   const int beginOk = mqttClient.beginMessage(topic.c_str(), (unsigned long)measuredJsonSize, retained);
   size_t mqttBytesWritten = 0;
   int endOk = 0;
@@ -672,6 +701,8 @@ bool publishJsonDocument(const char* label, const String& topic, bool retained, 
     mqttBytesWritten = serializeJson(doc, mqttClient);
     endOk = mqttClient.endMessage();
   }
+  const unsigned long publishDuration = millis() - publishStarted;
+  mqttClient.poll();
 
   Serial.print(label);
   Serial.print(" mqtt_begin=");
@@ -679,7 +710,14 @@ bool publishJsonDocument(const char* label, const String& topic, bool retained, 
   Serial.print(" mqtt_written=");
   Serial.print(mqttBytesWritten);
   Serial.print(" mqtt_end=");
-  Serial.println(endOk);
+  Serial.print(endOk);
+  Serial.print(" duration_ms=");
+  Serial.println(publishDuration);
+  if (publishDuration > PUBLISH_WARN_MS) {
+    Serial.print(label);
+    Serial.print(" WARNING: publish duration_ms=");
+    Serial.println(publishDuration);
+  }
   if (!beginOk || !endOk || mqttBytesWritten != measuredJsonSize) {
     Serial.print(label);
     Serial.println(" ERROR: MQTT publish did not write the full payload");
@@ -806,20 +844,75 @@ void writeSwitchChannel(JsonObject target, size_t index) {
   writeSwitchTestResult(lastTest, switchResults[index]);
 }
 
+void writeSwitchChannelCompact(JsonObject target, size_t index, bool includeObservation, bool includeLastTest) {
+  SwitchConfig& config = switchConfigs[index];
+  target["enabled"] = config.enabled;
+  target["pin"] = config.pin;
+  target["pin_label"] = switchPinLabel(config.pin);
+  target["mode"] = switchModeName(config.mode);
+  target["pull_mode"] = switchPullModeName(config.pullMode);
+  target["test_mode"] = switchTestModeName(config.testMode);
+  target["effective_pull_mode"] = effectiveSwitchPullModeName(config.pullMode);
+  target["debounce_ms"] = config.debounceMs;
+  target["settle_ms"] = config.settleMs;
+  target["observation_duration_s"] = config.observationDurationS;
+  target["configured"] = switchConfigured(index);
+  target["relay_follow_enabled"] = config.testMode == SWITCH_TEST_RELAY_FOLLOW;
+  target["commanded_by"] = relayCommandedBy[index];
+  target["status"] = switchChannelStatus[index];
+  target["command_id"] = lastCommandId;
+  target["command_seq"] = switchChannelSeq[index];
+
+  JsonObject current = target.createNestedObject("current");
+  writeSwitchReading(current, switchReadings[index]);
+
+  if (includeObservation || switchObservations[index].active || switchObservations[index].available) {
+    JsonObject observation = target.createNestedObject("observation");
+    writeSwitchObservation(observation, switchObservations[index]);
+  }
+
+  if (includeLastTest || switchResults[index].available) {
+    JsonObject lastTest = target.createNestedObject("last_test");
+    writeSwitchTestResult(lastTest, switchResults[index]);
+  }
+}
+
+bool publishSwitchEvent(const char* eventName, int channelIndex, bool retained, bool includeObservation = false, bool includeLastTest = false) {
+  if (channelIndex < 0 || channelIndex >= (int)SWITCH_CHANNEL_COUNT) {
+    return false;
+  }
+
+  lastSwitchEventPublishStartedMs = millis();
+  StaticJsonDocument<SWITCH_EVENT_JSON_CAPACITY> doc;
+  doc["event"] = eventName;
+  doc["channel"] = SWITCH_CHANNEL_KEYS[channelIndex];
+  doc["uptime_ms"] = millis();
+  doc["last_command"] = lastCommandSummaryBuffer;
+  doc["command_id"] = lastCommandId;
+  doc["command_seq"] = lastCommandSeq;
+  JsonObject timing = doc.createNestedObject("timing");
+  timing["firmware_command_received_ms"] = lastCommandReceivedMs;
+  timing["firmware_switch_sampled_ms"] = lastSwitchSampledMs;
+  timing["firmware_state_publish_started_ms"] = lastStatePublishStartedMs;
+  timing["firmware_switch_publish_started_ms"] = lastSwitchEventPublishStartedMs;
+
+  JsonObject switchTests = doc.createNestedObject("switch_tests");
+  JsonObject channel = switchTests.createNestedObject(SWITCH_CHANNEL_KEYS[channelIndex]);
+  writeSwitchChannelCompact(channel, (size_t)channelIndex, includeObservation, includeLastTest);
+
+  bool ok = publishJsonDocument("publishSwitchEvent", switchTopic, retained, doc, SWITCH_EVENT_JSON_CAPACITY);
+  if (ok) {
+    switchEventDirty[channelIndex] = false;
+  }
+  return ok;
+}
+
 bool shouldIncludeSwitchTests(bool forceSwitchTests) {
 #if LVTP_ENABLE_FULL_SWITCH_TEST_STATE
   (void)forceSwitchTests;
   return true;
 #else
-  if (forceSwitchTests) {
-    return true;
-  }
-  for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
-    if (switchConfigs[i].enabled || switchReadings[i].configured || switchResults[i].available || switchObservations[i].available) {
-      return true;
-    }
-  }
-  return false;
+  return forceSwitchTests;
 #endif
 }
 
@@ -1033,7 +1126,7 @@ void handleCommand(int messageSize) {
     Serial.print("handleCommand invalid_json error=");
     Serial.println(error.c_str());
     setLastCommandSummary("invalid_json");
-    publishState(true, true);
+    publishState(true);
     return;
   }
 
@@ -1060,8 +1153,24 @@ void handleCommand(int messageSize) {
 
   bool handled = false;
   int touchedSwitchIndex = -1;
+  bool touchedSwitchChannels[SWITCH_CHANNEL_COUNT] = {false, false};
+  bool includeSwitchObservation[SWITCH_CHANNEL_COUNT] = {false, false};
+  bool includeSwitchLastTest[SWITCH_CHANNEL_COUNT] = {false, false};
+  const char* switchEventNames[SWITCH_CHANNEL_COUNT] = {"switch_config", "switch_config"};
   JsonObject switchTests = doc["switch_tests"];
-  if (updateSwitchConfigs(switchTests, lastCommandSeq, touchedSwitchIndex)) {
+  bool hasSwitchConfigCommand = false;
+  if (!switchTests.isNull()) {
+    for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
+      JsonObject configDoc = switchTests[SWITCH_CHANNEL_KEYS[i]];
+      if (!configDoc.isNull()) {
+        hasSwitchConfigCommand = true;
+        touchedSwitchChannels[i] = true;
+        switchEventDirty[i] = true;
+        switchEventNames[i] = "switch_config";
+      }
+    }
+  }
+  if (updateSwitchConfigs(switchTests, lastCommandSeq, touchedSwitchIndex) || hasSwitchConfigCommand) {
     setLastCommandSummary("switch_config");
     handled = true;
   }
@@ -1097,6 +1206,9 @@ void handleCommand(int messageSize) {
     if (index >= 0) {
       switchChannelSeq[index] = lastCommandSeq;
       touchedSwitchIndex = (int)index;
+      touchedSwitchChannels[index] = true;
+      switchEventDirty[index] = true;
+      switchEventNames[index] = "switch_read";
       SwitchReading reading = readSwitch((size_t)index);
       lastSwitchSampledMs = reading.sampledAt;
       Serial.print("read_switch command_id=");
@@ -1122,6 +1234,10 @@ void handleCommand(int messageSize) {
     if (index >= 0) {
       switchChannelSeq[index] = lastCommandSeq;
       touchedSwitchIndex = (int)index;
+      touchedSwitchChannels[index] = true;
+      switchEventDirty[index] = true;
+      includeSwitchLastTest[index] = true;
+      switchEventNames[index] = "switch_test";
       runSwitchTest((size_t)index);
       setLastCommandSummary2("switch_test:", SWITCH_CHANNEL_KEYS[index]);
     } else {
@@ -1136,6 +1252,10 @@ void handleCommand(int messageSize) {
     if (index >= 0) {
       switchChannelSeq[index] = lastCommandSeq;
       touchedSwitchIndex = (int)index;
+      touchedSwitchChannels[index] = true;
+      switchEventDirty[index] = true;
+      includeSwitchObservation[index] = true;
+      switchEventNames[index] = "switch_observe";
       if (switchConfigs[index].testMode == SWITCH_TEST_TIMED_OBSERVATION) {
         startSwitchObservation((size_t)index);
         setLastCommandSummary2("switch_observe:", SWITCH_CHANNEL_KEYS[index]);
@@ -1154,6 +1274,10 @@ void handleCommand(int messageSize) {
     if (index >= 0) {
       switchChannelSeq[index] = lastCommandSeq;
       touchedSwitchIndex = (int)index;
+      touchedSwitchChannels[index] = true;
+      switchEventDirty[index] = true;
+      includeSwitchObservation[index] = true;
+      switchEventNames[index] = "switch_observe_cancel";
       finishSwitchObservation((size_t)index, "cancelled");
       setLastCommandSummary2("switch_observe_cancel:", SWITCH_CHANNEL_KEYS[index]);
     } else {
@@ -1167,7 +1291,17 @@ void handleCommand(int messageSize) {
   }
 
   applyOutputs();
-  publishState(true, true, touchedSwitchIndex >= 0 ? touchedSwitchIndex : -1);
+  bool publishedSwitchEvent = false;
+  for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
+    if (touchedSwitchChannels[i]) {
+      publishSwitchEvent(switchEventNames[i], (int)i, true, includeSwitchObservation[i], includeSwitchLastTest[i]);
+      publishedSwitchEvent = true;
+    }
+  }
+
+  if (!publishedSwitchEvent || !out.isNull()) {
+    publishState(true);
+  }
 }
 
 void connectWifi() {
@@ -1242,7 +1376,10 @@ void connectMqtt() {
 #else
     Serial.println("publishCapabilities disabled by LVTP_ENABLE_CAPABILITIES_PUBLISH=0");
 #endif
-    publishState(true, true);
+    publishState(true);
+    for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
+      publishSwitchEvent("switch_snapshot", (int)i, true);
+    }
   } else {
     Serial.print("MQTT failed, error ");
     Serial.print(mqttClient.connectError());
@@ -1262,6 +1399,7 @@ void setupTopics() {
   capabilitiesTopic = base + "/capabilities";
   telemetryTopic = base + "/telemetry";
   statusTopic = base + "/status";
+  switchTopic = base + "/switch";
 }
 
 void setup() {
@@ -1305,6 +1443,7 @@ void setup() {
 }
 
 void loop() {
+  const unsigned long loopStarted = millis();
   connectWifi();
 
   if (!mqttClient.connected()) {
@@ -1335,14 +1474,32 @@ void loop() {
     Serial.print(" wifi_status=");
     Serial.print(WiFi.status());
     Serial.print(" state_dirty=");
-    Serial.println(stateDirty);
+    Serial.print(stateDirty);
+    Serial.print(" last_loop_duration_ms=");
+    Serial.println(lastLoopDurationMs);
   }
   if (mqttClient.connected() && now - lastTelemetryPublish >= TELEMETRY_PUBLISH_INTERVAL_MS) {
     lastTelemetryPublish = now;
     publishTelemetry();
   }
+  if (mqttClient.connected()) {
+    for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
+      if (switchEventDirty[i]) {
+        publishSwitchEvent("switch_update", (int)i, true, switchObservations[i].active || switchObservations[i].available, switchResults[i].available);
+      }
+    }
+  }
   if (mqttClient.connected() && (stateDirty || now - lastStatePublish >= STATE_PUBLISH_INTERVAL_MS)) {
     lastStatePublish = now;
     publishState(true);
+  }
+  lastLoopDurationMs = millis() - loopStarted;
+  if (lastLoopDurationMs > LOOP_WARN_MS) {
+    Serial.print("loop WARNING duration_ms=");
+    Serial.print(lastLoopDurationMs);
+    Serial.print(" mqtt_connected=");
+    Serial.print(mqttClient.connected());
+    Serial.print(" state_dirty=");
+    Serial.println(stateDirty);
   }
 }

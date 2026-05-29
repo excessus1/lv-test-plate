@@ -58,6 +58,7 @@ class Settings:
             "cmd": f"{base}/cmd",
             "state": f"{base}/state",
             "capabilities": f"{base}/capabilities",
+            "switch": f"{base}/switch",
             "telemetry": f"{base}/telemetry",
             "status": f"{base}/status",
         }
@@ -102,12 +103,14 @@ class DashboardState:
             "messages": {
                 "state": None,
                 "capabilities": None,
+                "switch": None,
                 "telemetry": None,
                 "status": None,
             },
             "latency": {
                 "last_command": None,
                 "last_state": None,
+                "last_switch": None,
             },
         }
 
@@ -229,6 +232,23 @@ class DashboardState:
                 pin_options = capabilities.get("switch_input_pin_options")
                 if isinstance(pin_options, list):
                     self._state["switch_input_pin_options"] = pin_options
+            elif topic_key == "switch" and isinstance(payload, dict):
+                switch_tests = payload.get("switch_tests")
+                if isinstance(switch_tests, dict):
+                    _merge_switch_tests(self._state["switch_tests"], switch_tests)
+                if "last_command" in payload:
+                    self._state["last_command"] = payload["last_command"]
+                self._state["telemetry"]["uptime_ms"] = payload.get("uptime_ms", self._state["telemetry"]["uptime_ms"])
+                self._state["latency"]["last_switch"] = {
+                    "command_id": payload.get("command_id"),
+                    "command_seq": payload.get("command_seq"),
+                    "channel": payload.get("channel"),
+                    "event": payload.get("event"),
+                    "payload_bytes": payload_size,
+                    "fastapi_mqtt_received_ts_ms": round(received_at * 1000, 3),
+                    "fastapi_state_updated_ts_ms": round(now * 1000, 3),
+                    "firmware": payload.get("timing") if isinstance(payload.get("timing"), dict) else {},
+                }
             elif topic_key == "telemetry" and isinstance(payload, dict):
                 self._state["telemetry"].update(
                     {
@@ -643,7 +663,7 @@ def _make_mqtt_client() -> mqtt.Client:
         logger.info("MQTT connect result: %s", reason_code)
         snapshot = state.update_app(mqtt_connected=connected, last_error=None if connected else str(reason_code))
         if connected:
-            for topic_key in ("state", "capabilities", "telemetry", "status"):
+            for topic_key in ("state", "capabilities", "switch", "telemetry", "status"):
                 topic = settings.topics[topic_key]
                 client.subscribe(topic)
                 logger.info("Subscribed to MQTT topic %s", topic)
@@ -688,6 +708,16 @@ def _make_mqtt_client() -> mqtt.Client:
                 "FastAPI state updated command_id=%s updated_ts_ms=%s payload_bytes=%s",
                 snapshot.get("latency", {}).get("last_state", {}).get("command_id") or "-",
                 snapshot.get("latency", {}).get("last_state", {}).get("fastapi_state_updated_ts_ms"),
+                len(message.payload),
+            )
+        if topic_key == "switch":
+            logger.info(
+                "FastAPI switch updated command_id=%s seq=%s channel=%s event=%s updated_ts_ms=%s payload_bytes=%s",
+                snapshot.get("latency", {}).get("last_switch", {}).get("command_id") or "-",
+                snapshot.get("latency", {}).get("last_switch", {}).get("command_seq"),
+                snapshot.get("latency", {}).get("last_switch", {}).get("channel"),
+                snapshot.get("latency", {}).get("last_switch", {}).get("event"),
+                snapshot.get("latency", {}).get("last_switch", {}).get("fastapi_state_updated_ts_ms"),
                 len(message.payload),
             )
         _schedule_broadcast(

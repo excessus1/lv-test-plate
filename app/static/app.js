@@ -1,4 +1,4 @@
-const APP_JS_VERSION = "ordered-switch-state-2026-05-29-1";
+const APP_JS_VERSION = "mqtt-responsive-switch-events-2026-05-29-1";
 
 const DEFAULT_OUTPUTS = {
   relay_1: false,
@@ -57,7 +57,7 @@ const DEFAULT_SWITCH_TEST = {
 };
 
 let latest = null;
-let lastRenderedStateCommandId = null;
+let lastRenderedLatencyKey = null;
 let clientCommandSeq = 0;
 
 const pwmSync = {
@@ -318,26 +318,33 @@ function summarizeLatency(snapshot, renderStartedMs, source) {
   const latency = snapshot?.latency || {};
   const command = latency.last_command || {};
   const state = latency.last_state || {};
-  const stateCommandId = state.command_id;
-  if (!stateCommandId || stateCommandId === lastRenderedStateCommandId) return;
-  lastRenderedStateCommandId = stateCommandId;
+  const switchEvent = latency.last_switch || {};
+  const stateCommandId = switchEvent.command_id || state.command_id;
+  if (!stateCommandId) return;
+  const latencyKey = `${switchEvent.event || "state"}:${switchEvent.channel || "-"}:${stateCommandId}:${switchEvent.command_seq || "-"}`;
+  if (latencyKey === lastRenderedLatencyKey) return;
+  lastRenderedLatencyKey = latencyKey;
 
   const clientClick = Number(command.client_perf_click_ms);
   const browserRenderDeltaMs = Number.isFinite(clientClick) ? renderStartedMs - clientClick : null;
-  const firmware = state.firmware || {};
+  const firmware = switchEvent.firmware || state.firmware || {};
   const firmwareCommandToSampleMs = Number(firmware.firmware_switch_sampled_ms || 0) - Number(firmware.firmware_command_received_ms || 0);
-  const firmwareSampleToPublishMs = Number(firmware.firmware_state_publish_started_ms || 0) - Number(firmware.firmware_switch_sampled_ms || 0);
+  const firmwarePublishStartedMs = Number(firmware.firmware_switch_publish_started_ms || firmware.firmware_state_publish_started_ms || 0);
+  const firmwareSampleToPublishMs = firmwarePublishStartedMs - Number(firmware.firmware_switch_sampled_ms || 0);
   const row = {
     source,
     command_id: stateCommandId,
+    switch_event: switchEvent.event || "n/a",
+    switch_channel: switchEvent.channel || "n/a",
     browser_click_to_render_ms: browserRenderDeltaMs === null ? "n/a" : Math.round(browserRenderDeltaMs),
     api_to_publish_ms: command.server_mqtt_publish_ts_ms && command.server_api_received_ts_ms ? Math.round(command.server_mqtt_publish_ts_ms - command.server_api_received_ts_ms) : "n/a",
     firmware_command_to_sample_ms: Number.isFinite(firmwareCommandToSampleMs) ? firmwareCommandToSampleMs : "n/a",
     firmware_sample_to_publish_ms: Number.isFinite(firmwareSampleToPublishMs) ? firmwareSampleToPublishMs : "n/a",
+    switch_payload_bytes: switchEvent.payload_bytes || "n/a",
     state_payload_bytes: state.payload_bytes || "n/a",
   };
   console.table([row]);
-  setDebug(`Rendered ${stateCommandId}: ${row.browser_click_to_render_ms}ms, payload ${row.state_payload_bytes}B`);
+  setDebug(`Rendered ${stateCommandId}: ${row.browser_click_to_render_ms}ms, switch ${row.switch_payload_bytes}B, state ${row.state_payload_bytes}B`);
 }
 
 function render(snapshot, source = "render") {
