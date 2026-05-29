@@ -54,6 +54,15 @@
                   <select data-switch-field="pin"></select>
                 </label>
                 <label>
+                  <span>Test type</span>
+                  <select data-switch-field="test_mode">
+                    <option value="passive_read">Passive read only</option>
+                    <option value="relay_follow">Relay follows switch</option>
+                    <option value="timed_observation">Timed observation window</option>
+                    <option value="output_feedback">Output-driven feedback test</option>
+                  </select>
+                </label>
+                <label>
                   <span>Mode</span>
                   <select data-switch-field="mode">
                     <option value="NO">NO</option>
@@ -72,9 +81,13 @@
                   <span>Debounce ms</span>
                   <input data-switch-field="debounce_ms" type="number" min="0" max="1000" step="1" />
                 </label>
-                <label>
+                <label data-mode-section="output_feedback">
                   <span>Settle ms</span>
                   <input data-switch-field="settle_ms" type="number" min="0" max="5000" step="1" />
+                </label>
+                <label data-mode-section="timed_observation">
+                  <span>Observation seconds</span>
+                  <input data-switch-field="observation_duration_s" type="number" min="1" max="3600" step="1" />
                 </label>
               </div>
               <div class="switch-status">
@@ -85,7 +98,8 @@
               </div>
               <div class="switch-actions">
                 <button data-switch-action="read" type="button">Read switch now</button>
-                <button data-switch-action="test" type="button">Test relay + switch</button>
+                <button data-switch-action="observe" data-mode-section="timed_observation" type="button">Start observation</button>
+                <button data-switch-action="test" data-mode-section="output_feedback" type="button">Run output feedback test</button>
               </div>
             </details>
 
@@ -101,6 +115,15 @@
                   <select data-switch-field="pin"></select>
                 </label>
                 <label>
+                  <span>Test type</span>
+                  <select data-switch-field="test_mode">
+                    <option value="passive_read">Passive read only</option>
+                    <option value="relay_follow">Relay follows switch</option>
+                    <option value="timed_observation">Timed observation window</option>
+                    <option value="output_feedback">Output-driven feedback test</option>
+                  </select>
+                </label>
+                <label>
                   <span>Mode</span>
                   <select data-switch-field="mode">
                     <option value="NO">NO</option>
@@ -119,9 +142,13 @@
                   <span>Debounce ms</span>
                   <input data-switch-field="debounce_ms" type="number" min="0" max="1000" step="1" />
                 </label>
-                <label>
+                <label data-mode-section="output_feedback">
                   <span>Settle ms</span>
                   <input data-switch-field="settle_ms" type="number" min="0" max="5000" step="1" />
+                </label>
+                <label data-mode-section="timed_observation">
+                  <span>Observation seconds</span>
+                  <input data-switch-field="observation_duration_s" type="number" min="1" max="3600" step="1" />
                 </label>
               </div>
               <div class="switch-status">
@@ -132,7 +159,8 @@
               </div>
               <div class="switch-actions">
                 <button data-switch-action="read" type="button">Read switch now</button>
-                <button data-switch-action="test" type="button">Test relay + switch</button>
+                <button data-switch-action="observe" data-mode-section="timed_observation" type="button">Start observation</button>
+                <button data-switch-action="test" data-mode-section="output_feedback" type="button">Run output feedback test</button>
               </div>
             </details>
           </div>

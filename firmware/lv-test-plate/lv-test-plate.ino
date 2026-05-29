@@ -37,6 +37,8 @@ const size_t SWITCH_CHANNEL_COUNT = 2;
 const char* SWITCH_CHANNEL_KEYS[] = {"relay_1", "relay_2"};
 const unsigned long DEFAULT_SWITCH_DEBOUNCE_MS = 30;
 const unsigned long DEFAULT_SWITCH_SETTLE_MS = 150;
+const unsigned long DEFAULT_OBSERVATION_DURATION_S = 30;
+const unsigned long SWITCH_SERVICE_INTERVAL_MS = 50;
 
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long STATE_PUBLISH_INTERVAL_MS = 5000;
@@ -44,9 +46,9 @@ const unsigned long TELEMETRY_PUBLISH_INTERVAL_MS = 2000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_POLL_DIAGNOSTIC_INTERVAL_MS = 5000;
 const char* SKETCH_ID = "lv-test-plate";
-const char* FIRMWARE_VERSION = "2026-05-29-stability-1";
-const size_t STATE_JSON_CAPACITY = 3072;
-const size_t CAPABILITIES_JSON_CAPACITY = 1536;
+const char* FIRMWARE_VERSION = "2026-05-29-switch-modes-1";
+const size_t STATE_JSON_CAPACITY = 6144;
+const size_t CAPABILITIES_JSON_CAPACITY = 2048;
 
 #ifndef LVTP_ENABLE_CAPABILITIES_PUBLISH
 #define LVTP_ENABLE_CAPABILITIES_PUBLISH 0
@@ -84,13 +86,22 @@ enum SwitchPullMode {
   SWITCH_PULL_DOWN
 };
 
+enum SwitchTestMode {
+  SWITCH_TEST_PASSIVE_READ,
+  SWITCH_TEST_RELAY_FOLLOW,
+  SWITCH_TEST_TIMED_OBSERVATION,
+  SWITCH_TEST_OUTPUT_FEEDBACK
+};
+
 struct SwitchConfig {
   bool enabled = false;
   int pin = NO_SWITCH_PIN;
   SwitchContactMode mode = SWITCH_MODE_NO;
   SwitchPullMode pullMode = SWITCH_PULL_UP;
+  SwitchTestMode testMode = SWITCH_TEST_PASSIVE_READ;
   unsigned long debounceMs = DEFAULT_SWITCH_DEBOUNCE_MS;
   unsigned long settleMs = DEFAULT_SWITCH_SETTLE_MS;
+  unsigned long observationDurationS = DEFAULT_OBSERVATION_DURATION_S;
 };
 
 struct SwitchReading {
@@ -111,16 +122,37 @@ struct SwitchTestResult {
   const char* status = "not_run";
 };
 
+struct SwitchObservation {
+  bool active = false;
+  bool available = false;
+  unsigned long durationMs = DEFAULT_OBSERVATION_DURATION_S * 1000UL;
+  unsigned long startedAt = 0;
+  unsigned long endedAt = 0;
+  SwitchReading start;
+  SwitchReading current;
+  SwitchReading end;
+  bool hasLast = false;
+  bool lastClosed = false;
+  unsigned int transitionCount = 0;
+  unsigned int openToClosedCount = 0;
+  unsigned int closedToOpenCount = 0;
+  const char* status = "not_started";
+};
+
 Outputs outputs;
 SwitchConfig switchConfigs[SWITCH_CHANNEL_COUNT];
 SwitchReading switchReadings[SWITCH_CHANNEL_COUNT];
 SwitchTestResult switchResults[SWITCH_CHANNEL_COUNT];
+SwitchObservation switchObservations[SWITCH_CHANNEL_COUNT];
+const char* relayCommandedBy[SWITCH_CHANNEL_COUNT] = {"manual", "manual"};
+const char* switchChannelStatus[SWITCH_CHANNEL_COUNT] = {"not_configured", "not_configured"};
 char lastCommandSummaryBuffer[96] = "";
 unsigned long lastMqttAttempt = 0;
 unsigned long lastWifiAttempt = 0;
 unsigned long lastStatePublish = 0;
 unsigned long lastTelemetryPublish = 0;
 unsigned long lastPollDiagnostic = 0;
+unsigned long lastSwitchService = 0;
 bool mqttWasConnected = false;
 bool wifiWasConnected = false;
 bool stateDirty = true;
@@ -157,12 +189,14 @@ void applyOutputs() {
   analogWrite(PWM_PIN, outputs.pwmEnabled ? constrain(outputs.pwmValue, 0, 255) : 0);
 }
 
-void allOutputsOff() {
+void allOutputsOff(const char* source = "safety") {
   outputs.relay1 = false;
   outputs.relay2 = false;
   outputs.ssr1 = false;
   outputs.pwmEnabled = false;
   outputs.pwmValue = 0;
+  relayCommandedBy[0] = source;
+  relayCommandedBy[1] = source;
   applyOutputs();
 }
 
@@ -224,6 +258,41 @@ const char* switchPullModeName(SwitchPullMode mode) {
     return "pulldown";
   }
   return "external";
+}
+
+const char* switchTestModeName(SwitchTestMode mode) {
+  if (mode == SWITCH_TEST_RELAY_FOLLOW) {
+    return "relay_follow";
+  }
+  if (mode == SWITCH_TEST_TIMED_OBSERVATION) {
+    return "timed_observation";
+  }
+  if (mode == SWITCH_TEST_OUTPUT_FEEDBACK) {
+    return "output_feedback";
+  }
+  return "passive_read";
+}
+
+SwitchTestMode parseSwitchTestMode(const char* raw, SwitchTestMode fallback) {
+  if (raw == nullptr) {
+    return fallback;
+  }
+  String value = raw;
+  value.trim();
+  value.toLowerCase();
+  if (value == "relay_follow" || value == "follow") {
+    return SWITCH_TEST_RELAY_FOLLOW;
+  }
+  if (value == "timed_observation" || value == "observe") {
+    return SWITCH_TEST_TIMED_OBSERVATION;
+  }
+  if (value == "output_feedback" || value == "feedback" || value == "output_driven") {
+    return SWITCH_TEST_OUTPUT_FEEDBACK;
+  }
+  if (value == "passive_read" || value == "passive" || value == "read") {
+    return SWITCH_TEST_PASSIVE_READ;
+  }
+  return fallback;
 }
 
 SwitchPullMode parseSwitchPullMode(const char* raw, SwitchPullMode fallback) {
@@ -330,13 +399,176 @@ SwitchReading readSwitch(size_t index) {
   return reading;
 }
 
-void setSwitchRelayOutput(size_t index, bool on) {
+void setSwitchRelayOutput(size_t index, bool on, const char* source) {
   if (index == 0) {
     outputs.relay1 = on;
+    relayCommandedBy[0] = source;
   } else if (index == 1) {
     outputs.relay2 = on;
+    relayCommandedBy[1] = source;
   }
   applyOutputs();
+}
+
+bool switchRelayOutput(size_t index) {
+  if (index == 0) {
+    return outputs.relay1;
+  }
+  if (index == 1) {
+    return outputs.relay2;
+  }
+  return false;
+}
+
+bool switchReadingChanged(const SwitchReading& before, const SwitchReading& after) {
+  return before.configured != after.configured || before.raw != after.raw || before.closed != after.closed;
+}
+
+void startSwitchObservation(size_t index) {
+  if (index >= SWITCH_CHANNEL_COUNT) {
+    return;
+  }
+
+  SwitchObservation observation;
+  observation.available = true;
+  observation.active = false;
+  observation.durationMs = constrain(switchConfigs[index].observationDurationS, 1, 3600) * 1000UL;
+  observation.startedAt = millis();
+  observation.status = "not_configured";
+
+  if (switchConfigured(index)) {
+    observation.start = readSwitch(index);
+    observation.current = observation.start;
+    observation.end = observation.start;
+    observation.lastClosed = observation.start.closed;
+    observation.hasLast = observation.start.configured;
+    observation.active = true;
+    observation.status = "observing";
+    switchChannelStatus[index] = "observing";
+  } else {
+    switchChannelStatus[index] = "not_configured";
+  }
+
+  switchObservations[index] = observation;
+  stateDirty = true;
+}
+
+void finishSwitchObservation(size_t index, const char* status) {
+  if (index >= SWITCH_CHANNEL_COUNT) {
+    return;
+  }
+  SwitchObservation& observation = switchObservations[index];
+  observation.active = false;
+  observation.available = true;
+  observation.endedAt = millis();
+  observation.end = observation.current;
+  observation.status = status;
+  switchChannelStatus[index] = status;
+  stateDirty = true;
+}
+
+void serviceSwitchObservation(size_t index) {
+  SwitchObservation& observation = switchObservations[index];
+  if (!observation.active) {
+    return;
+  }
+  if (!switchConfigured(index)) {
+    finishSwitchObservation(index, "not_configured");
+    return;
+  }
+
+  SwitchReading reading = readSwitch(index);
+  observation.current = reading;
+  if (reading.configured && observation.hasLast && reading.closed != observation.lastClosed) {
+    observation.transitionCount++;
+    if (!observation.lastClosed && reading.closed) {
+      observation.openToClosedCount++;
+    } else if (observation.lastClosed && !reading.closed) {
+      observation.closedToOpenCount++;
+    }
+    observation.lastClosed = reading.closed;
+    stateDirty = true;
+  } else if (reading.configured && !observation.hasLast) {
+    observation.hasLast = true;
+    observation.lastClosed = reading.closed;
+    stateDirty = true;
+  }
+
+  unsigned long elapsed = millis() - observation.startedAt;
+  if (elapsed >= observation.durationMs) {
+    finishSwitchObservation(index, observation.transitionCount > 0 ? "activity_observed" : "no_activity");
+  }
+}
+
+void serviceSwitchModes() {
+  unsigned long now = millis();
+  if (now - lastSwitchService < SWITCH_SERVICE_INTERVAL_MS) {
+    return;
+  }
+  lastSwitchService = now;
+
+  for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
+    SwitchConfig& config = switchConfigs[i];
+    if (!config.enabled) {
+      switchChannelStatus[i] = "disabled";
+      continue;
+    }
+
+    if (config.testMode == SWITCH_TEST_RELAY_FOLLOW) {
+      if (!switchConfigured(i)) {
+        if (switchRelayOutput(i)) {
+          setSwitchRelayOutput(i, false, "safety");
+          stateDirty = true;
+        }
+        relayCommandedBy[i] = "safety";
+        switchChannelStatus[i] = "relay_follow_not_configured";
+        continue;
+      }
+      SwitchReading before = switchReadings[i];
+      SwitchReading reading = readSwitch(i);
+      bool wasOn = switchRelayOutput(i);
+      if (wasOn != reading.closed) {
+        setSwitchRelayOutput(i, reading.closed, "switch");
+        stateDirty = true;
+      }
+      if (switchReadingChanged(before, reading)) {
+        stateDirty = true;
+      }
+      switchChannelStatus[i] = "relay_following";
+      continue;
+    }
+
+    if (config.testMode == SWITCH_TEST_TIMED_OBSERVATION) {
+      serviceSwitchObservation(i);
+      if (!switchObservations[i].active && switchConfigured(i)) {
+        SwitchReading before = switchReadings[i];
+        SwitchReading reading = readSwitch(i);
+        if (switchReadingChanged(before, reading)) {
+          stateDirty = true;
+        }
+      }
+      if (!switchObservations[i].active) {
+        switchChannelStatus[i] = switchConfigured(i) ? "observation_ready" : "not_configured";
+      }
+      continue;
+    }
+
+    if (config.testMode == SWITCH_TEST_PASSIVE_READ) {
+      if (switchConfigured(i)) {
+        SwitchReading before = switchReadings[i];
+        SwitchReading reading = readSwitch(i);
+        if (switchReadingChanged(before, reading)) {
+          stateDirty = true;
+        }
+        switchChannelStatus[i] = "passive_read";
+      } else {
+        switchChannelStatus[i] = "not_configured";
+      }
+      continue;
+    }
+
+    switchChannelStatus[i] = "output_feedback_ready";
+  }
 }
 
 void runSwitchTest(size_t index) {
@@ -348,15 +580,21 @@ void runSwitchTest(size_t index) {
   result.available = true;
   result.settleMs = switchConfigs[index].settleMs;
 
+  if (switchConfigs[index].testMode != SWITCH_TEST_OUTPUT_FEEDBACK) {
+    result.status = "wrong_mode";
+    switchResults[index] = result;
+    return;
+  }
+
   if (!switchConfigured(index)) {
     result.status = "not_configured";
     switchResults[index] = result;
     return;
   }
 
-  setSwitchRelayOutput(index, false);
+  setSwitchRelayOutput(index, false, "feedback_test");
   result.before = readSwitch(index);
-  setSwitchRelayOutput(index, true);
+  setSwitchRelayOutput(index, true, "feedback_test");
   delay(switchConfigs[index].settleMs > 5000 ? 5000 : switchConfigs[index].settleMs);
   result.after = readSwitch(index);
   result.changed = result.before.configured && result.after.configured && result.before.closed != result.after.closed;
@@ -366,7 +604,7 @@ void runSwitchTest(size_t index) {
   result.pass = result.before.configured && result.after.configured && result.before.closed == expectBeforeClosed && result.after.closed == expectAfterClosed && result.changed;
   result.status = result.pass ? "pass" : "fail";
 
-  setSwitchRelayOutput(index, false);
+  setSwitchRelayOutput(index, false, "feedback_test");
   switchResults[index] = result;
 }
 
@@ -459,6 +697,26 @@ void writeSwitchTestResult(JsonObject target, const SwitchTestResult& result) {
   writeSwitchReading(after, result.after);
 }
 
+void writeSwitchObservation(JsonObject target, const SwitchObservation& observation) {
+  target["active"] = observation.active;
+  target["available"] = observation.available;
+  target["status"] = observation.status;
+  target["duration_s"] = observation.durationMs / 1000UL;
+  target["started_at_ms"] = observation.startedAt;
+  target["ended_at_ms"] = observation.endedAt;
+  unsigned long elapsed = observation.startedAt > 0 ? millis() - observation.startedAt : 0;
+  target["remaining_ms"] = observation.active && elapsed < observation.durationMs ? observation.durationMs - elapsed : 0;
+  target["transition_count"] = observation.transitionCount;
+  target["open_to_closed_count"] = observation.openToClosedCount;
+  target["closed_to_open_count"] = observation.closedToOpenCount;
+  JsonObject start = target.createNestedObject("start");
+  writeSwitchReading(start, observation.start);
+  JsonObject current = target.createNestedObject("current");
+  writeSwitchReading(current, observation.current);
+  JsonObject end = target.createNestedObject("end");
+  writeSwitchReading(end, observation.end);
+}
+
 void writePinDescriptor(JsonObject target, int pin, const char* label) {
   target["pin"] = pin;
   target["label"] = label;
@@ -485,6 +743,12 @@ void publishCapabilities() {
   pullModes.add("pulldown");
   pullModes.add("external");
 
+  JsonArray testModes = doc.createNestedArray("supported_switch_test_modes");
+  testModes.add("passive_read");
+  testModes.add("relay_follow");
+  testModes.add("timed_observation");
+  testModes.add("output_feedback");
+
   JsonObject outputPins = doc.createNestedObject("output_pins");
   writePinDescriptor(outputPins.createNestedObject("relay_1"), RELAY_1_PIN, RELAY_1_PIN_LABEL);
   writePinDescriptor(outputPins.createNestedObject("relay_2"), RELAY_2_PIN, RELAY_2_PIN_LABEL);
@@ -507,13 +771,21 @@ void writeSwitchChannel(JsonObject target, size_t index) {
   target["pin_label"] = switchPinLabel(config.pin);
   target["mode"] = switchModeName(config.mode);
   target["pull_mode"] = switchPullModeName(config.pullMode);
+  target["test_mode"] = switchTestModeName(config.testMode);
   target["effective_pull_mode"] = effectiveSwitchPullModeName(config.pullMode);
   target["debounce_ms"] = config.debounceMs;
   target["settle_ms"] = config.settleMs;
+  target["observation_duration_s"] = config.observationDurationS;
   target["configured"] = switchConfigured(index);
+  target["relay_follow_enabled"] = config.testMode == SWITCH_TEST_RELAY_FOLLOW;
+  target["commanded_by"] = relayCommandedBy[index];
+  target["status"] = switchChannelStatus[index];
 
   JsonObject current = target.createNestedObject("current");
-  writeSwitchReading(current, switchConfigured(index) ? readSwitch(index) : switchReadings[index]);
+  writeSwitchReading(current, switchReadings[index]);
+
+  JsonObject observation = target.createNestedObject("observation");
+  writeSwitchObservation(observation, switchObservations[index]);
 
   JsonObject lastTest = target.createNestedObject("last_test");
   writeSwitchTestResult(lastTest, switchResults[index]);
@@ -528,7 +800,7 @@ bool shouldIncludeSwitchTests(bool forceSwitchTests) {
     return true;
   }
   for (size_t i = 0; i < SWITCH_CHANNEL_COUNT; i++) {
-    if (switchConfigs[i].enabled || switchReadings[i].configured || switchResults[i].available) {
+    if (switchConfigs[i].enabled || switchReadings[i].configured || switchResults[i].available || switchObservations[i].available) {
       return true;
     }
   }
@@ -638,6 +910,10 @@ bool updateSwitchConfig(size_t index, JsonObject configDoc) {
     config.pullMode = parseSwitchPullMode(configDoc["pull_mode"].as<const char*>(), config.pullMode);
     changed = true;
   }
+  if (configDoc.containsKey("test_mode")) {
+    config.testMode = parseSwitchTestMode(configDoc["test_mode"].as<const char*>(), config.testMode);
+    changed = true;
+  }
   if (configDoc.containsKey("debounce_ms")) {
     config.debounceMs = constrain(configDoc["debounce_ms"].as<int>(), 0, 1000);
     changed = true;
@@ -646,11 +922,26 @@ bool updateSwitchConfig(size_t index, JsonObject configDoc) {
     config.settleMs = constrain(configDoc["settle_ms"].as<int>(), 0, 5000);
     changed = true;
   }
+  if (configDoc.containsKey("observation_duration_s")) {
+    config.observationDurationS = constrain(configDoc["observation_duration_s"].as<int>(), 1, 3600);
+    changed = true;
+  }
 
   if (changed) {
     configureSwitchPin(index);
+    if (switchObservations[index].active && config.testMode != SWITCH_TEST_TIMED_OBSERVATION) {
+      finishSwitchObservation(index, "cancelled");
+    }
+    if (config.testMode == SWITCH_TEST_RELAY_FOLLOW && !switchConfigured(index)) {
+      setSwitchRelayOutput(index, false, "safety");
+      switchChannelStatus[index] = "relay_follow_not_configured";
+    }
   }
   return changed;
+}
+
+bool relayFollowOwnsOutput(size_t index) {
+  return index < SWITCH_CHANNEL_COUNT && switchConfigs[index].enabled && switchConfigs[index].testMode == SWITCH_TEST_RELAY_FOLLOW;
 }
 
 bool updateSwitchConfigs(JsonObject switchTests) {
@@ -708,8 +999,22 @@ void handleCommand(int messageSize) {
 
   JsonObject out = doc["outputs"];
   if (!out.isNull()) {
-    if (out.containsKey("relay_1")) outputs.relay1 = out["relay_1"].as<bool>();
-    if (out.containsKey("relay_2")) outputs.relay2 = out["relay_2"].as<bool>();
+    if (out.containsKey("relay_1")) {
+      if (relayFollowOwnsOutput(0)) {
+        switchChannelStatus[0] = "manual_ignored_relay_follow";
+      } else {
+        outputs.relay1 = out["relay_1"].as<bool>();
+        relayCommandedBy[0] = "manual";
+      }
+    }
+    if (out.containsKey("relay_2")) {
+      if (relayFollowOwnsOutput(1)) {
+        switchChannelStatus[1] = "manual_ignored_relay_follow";
+      } else {
+        outputs.relay2 = out["relay_2"].as<bool>();
+        relayCommandedBy[1] = "manual";
+      }
+    }
     if (out.containsKey("ssr_1")) outputs.ssr1 = out["ssr_1"].as<bool>();
     if (out.containsKey("pwm_enabled")) outputs.pwmEnabled = out["pwm_enabled"].as<bool>();
     if (out.containsKey("pwm_value")) outputs.pwmValue = constrain(out["pwm_value"].as<int>(), 0, 255);
@@ -737,6 +1042,34 @@ void handleCommand(int messageSize) {
       setLastCommandSummary2("switch_test:", SWITCH_CHANNEL_KEYS[index]);
     } else {
       setLastCommandSummary("switch_test:invalid_channel");
+    }
+    handled = true;
+  }
+
+  if (doc.containsKey("observe_switch")) {
+    const char* channel = doc["observe_switch"].as<const char*>();
+    int index = switchChannelIndex(channel);
+    if (index >= 0) {
+      if (switchConfigs[index].testMode == SWITCH_TEST_TIMED_OBSERVATION) {
+        startSwitchObservation((size_t)index);
+        setLastCommandSummary2("switch_observe:", SWITCH_CHANNEL_KEYS[index]);
+      } else {
+        setLastCommandSummary2("switch_observe_wrong_mode:", SWITCH_CHANNEL_KEYS[index]);
+      }
+    } else {
+      setLastCommandSummary("switch_observe:invalid_channel");
+    }
+    handled = true;
+  }
+
+  if (doc.containsKey("stop_observation")) {
+    const char* channel = doc["stop_observation"].as<const char*>();
+    int index = switchChannelIndex(channel);
+    if (index >= 0) {
+      finishSwitchObservation((size_t)index, "cancelled");
+      setLastCommandSummary2("switch_observe_cancel:", SWITCH_CHANNEL_KEYS[index]);
+    } else {
+      setLastCommandSummary("switch_observe_cancel:invalid_channel");
     }
     handled = true;
   }
@@ -902,6 +1235,7 @@ void loop() {
   }
 
   mqttClient.poll();
+  serviceSwitchModes();
 
   unsigned long now = millis();
   if (now - lastPollDiagnostic >= MQTT_POLL_DIAGNOSTIC_INTERVAL_MS) {

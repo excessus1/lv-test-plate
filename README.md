@@ -104,11 +104,13 @@ Per-relay switch-test settings:
 
 - enabled/disabled
 - input pin selected from the firmware-published pin options
+- test type: `passive_read`, `relay_follow`, `timed_observation`, or `output_feedback`
 - switch mode: `NO` or `NC`
 - pull mode: `pullup`, `pulldown`, or `external`
 - debounce time in milliseconds
-- settle delay in milliseconds
-- read-now and relay-plus-switch test actions
+- observation duration in seconds for timed observation
+- settle delay in milliseconds for output-driven feedback tests
+- read-now, timed observation, and output feedback actions
 
 It displays:
 
@@ -120,7 +122,16 @@ It displays:
 - analog potentiometer input
 - last command received by the board
 - current switch open/closed state and raw digital state for configured relay switch tests
-- last relay-plus-switch test result
+- relay-follow ownership/status, timed observation summaries, and last output feedback result
+
+Switch test types:
+
+- `passive_read`: reads and interprets the configured switch input without controlling the relay. Manual relay control remains available.
+- `relay_follow`: the interpreted switch closed/active state drives the associated relay continuously. Manual relay control is disabled while this mode owns the relay.
+- `timed_observation`: watches the input for a human-facing duration, counts transitions, and records starting/ending state without requiring relay output.
+- `output_feedback`: preserves the output-driven feedback test: read before, turn the relay on, wait `settle_ms`, read after, then turn the relay off and report pass/fail.
+
+For current bench validation, prefer `relay_2` with D6, `NO`, and `pullup`: D6 open reads HIGH/open/off, and D6 grounded reads LOW/closed/on. Relay 1 has known hardware issues right now.
 
 ## MQTT Payloads
 
@@ -145,30 +156,36 @@ Switch-test configuration and actions are additive top-level command fields. Exi
 ```json
 {
   "switch_tests": {
-    "relay_1": {
+    "relay_2": {
       "enabled": true,
-      "pin": 2,
+      "pin": 6,
+      "test_mode": "relay_follow",
       "mode": "NO",
       "pull_mode": "pullup",
       "debounce_ms": 30,
-      "settle_ms": 150
+      "settle_ms": 150,
+      "observation_duration_s": 30
     }
   },
-  "read_switch": "relay_1",
-  "test_switch": "relay_1",
+  "read_switch": "relay_2",
+  "observe_switch": "relay_2",
+  "test_switch": "relay_2",
   "source": "web",
   "ts": 1716500000.0
 }
 ```
+
+Use `read_switch` in any test type. Use `observe_switch` with `timed_observation`. Use `test_switch` with `output_feedback`; it is intentionally not the default basic switch workflow.
 
 Board capabilities messages are retained static/semi-static board metadata. The sketch is authoritative for pin assignments and switch input options; docs may lag behind the `.ino`.
 
 ```json
 {
   "sketch": "lv-test-plate",
-  "firmware_version": "2026-05-29-stability-1",
+  "firmware_version": "2026-05-29-switch-modes-1",
   "supported_switch_modes": ["NO", "NC"],
   "supported_pull_modes": ["pullup", "pulldown", "external"],
+  "supported_switch_test_modes": ["passive_read", "relay_follow", "timed_observation", "output_feedback"],
   "output_pins": {
     "relay_1": {"pin": 8, "label": "D8"},
     "relay_2": {"pin": 13, "label": "D13"},
@@ -197,16 +214,21 @@ Board state messages are retained dynamic state. Static board metadata such as `
     "pwm_value": 128
   },
   "switch_tests": {
-    "relay_1": {
+    "relay_2": {
       "enabled": true,
-      "pin": 2,
-      "pin_label": "D2",
+      "pin": 6,
+      "pin_label": "D6",
+      "test_mode": "relay_follow",
       "mode": "NO",
       "pull_mode": "pullup",
       "effective_pull_mode": "pullup",
       "debounce_ms": 30,
       "settle_ms": 150,
+      "observation_duration_s": 30,
       "configured": true,
+      "relay_follow_enabled": true,
+      "commanded_by": "switch",
+      "status": "relay_following",
       "current": {
         "configured": true,
         "raw": 1,
@@ -216,14 +238,24 @@ Board state messages are retained dynamic state. Static board metadata such as `
         "bounce_count": 0,
         "sampled_at_ms": 12000
       },
-      "last_test": {
+      "observation": {
+        "active": false,
         "available": true,
-        "status": "pass",
-        "pass": true,
-        "changed": true,
+        "status": "activity_observed",
+        "duration_s": 30,
+        "remaining_ms": 0,
+        "transition_count": 5,
+        "open_to_closed_count": 3,
+        "closed_to_open_count": 2
+      },
+      "last_test": {
+        "available": false,
+        "status": "not_run",
+        "pass": false,
+        "changed": false,
         "settle_ms": 150,
-        "before": {"state": "open", "raw_state": "HIGH", "closed": false},
-        "after": {"state": "closed", "raw_state": "LOW", "closed": true}
+        "before": {"state": "unconfigured", "raw_state": "n/a", "closed": false},
+        "after": {"state": "unconfigured", "raw_state": "n/a", "closed": false}
       }
     }
   },
@@ -354,7 +386,7 @@ With the app running, you can simulate board messages from another shell:
 
 ```sh
 mosquitto_pub -h "$MQTT_HOST" -t lv-test-plate/status -r -m online
-mosquitto_pub -h "$MQTT_HOST" -t lv-test-plate/capabilities -r -m '{"sketch":"lv-test-plate","firmware_version":"smoke-test","supported_switch_modes":["NO","NC"],"supported_pull_modes":["pullup","pulldown","external"],"switch_input_pin_options":[{"pin":2,"label":"D2"},{"pin":4,"label":"D4"}]}'
+mosquitto_pub -h "$MQTT_HOST" -t lv-test-plate/capabilities -r -m '{"sketch":"lv-test-plate","firmware_version":"smoke-test","supported_switch_modes":["NO","NC"],"supported_pull_modes":["pullup","pulldown","external"],"supported_switch_test_modes":["passive_read","relay_follow","timed_observation","output_feedback"],"switch_input_pin_options":[{"pin":2,"label":"D2"},{"pin":4,"label":"D4"},{"pin":6,"label":"D6"}]}'
 mosquitto_pub -h "$MQTT_HOST" -t lv-test-plate/telemetry -m '{"uptime_ms":5000,"wifi_rssi":-55,"pot_value":321,"wifi_connected":true,"mqtt_connected":true}'
 mosquitto_pub -h "$MQTT_HOST" -t lv-test-plate/state -r -m '{"outputs":{"relay_1":false,"relay_2":false,"ssr_1":false,"pwm_enabled":false,"pwm_value":0},"uptime_ms":5000,"last_command":"manual smoke test"}'
 ```

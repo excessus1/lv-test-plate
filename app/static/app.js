@@ -1,4 +1,4 @@
-const APP_JS_VERSION = "capabilities-2026-05-29-1";
+const APP_JS_VERSION = "switch-modes-2026-05-29-1";
 
 const DEFAULT_OUTPUTS = {
   relay_1: false,
@@ -16,9 +16,14 @@ const DEFAULT_SWITCH_TEST = {
   mode: "NO",
   pull_mode: "pullup",
   effective_pull_mode: "pullup",
+  test_mode: "passive_read",
   debounce_ms: 30,
   settle_ms: 150,
+  observation_duration_s: 30,
   configured: false,
+  relay_follow_enabled: false,
+  commanded_by: "manual",
+  status: "not_configured",
   current: {
     configured: false,
     raw: -1,
@@ -26,6 +31,16 @@ const DEFAULT_SWITCH_TEST = {
     closed: false,
     state: "unconfigured",
     bounce_count: 0,
+  },
+  observation: {
+    active: false,
+    available: false,
+    status: "not_started",
+    duration_s: 30,
+    remaining_ms: 0,
+    transition_count: 0,
+    open_to_closed_count: 0,
+    closed_to_open_count: 0,
   },
   last_test: {
     available: false,
@@ -138,6 +153,39 @@ function formatSwitchResult(result) {
   return `${result.status || "unknown"} (${before} -> ${after}, ${changed})`;
 }
 
+function formatObservation(observation) {
+  if (!observation?.available && !observation?.active) return "not started";
+  const transitions = Number(observation.transition_count || 0);
+  const remainingMs = Number(observation.remaining_ms || 0);
+  const remaining = observation.active ? `, ${Math.ceil(remainingMs / 1000)}s left` : "";
+  return `${observation.status || "unknown"} (${transitions} transitions${remaining})`;
+}
+
+function formatModeResult(config) {
+  const mode = config.test_mode || "passive_read";
+  if (mode === "timed_observation") {
+    return `Observation: ${formatObservation(config.observation)}`;
+  }
+  if (mode === "relay_follow") {
+    return `Relay follow: ${config.configured ? config.status || "following" : "not configured"}`;
+  }
+  if (mode === "output_feedback") {
+    return `Feedback: ${formatSwitchResult(config.last_test)}`;
+  }
+  return `Read: ${config.status || "passive read"}`;
+}
+
+function outputKeyToSwitchChannel(key) {
+  return key === "relay_1" || key === "relay_2" ? key : null;
+}
+
+function relayFollowOverridesOutput(key) {
+  const channel = outputKeyToSwitchChannel(key);
+  if (!channel) return false;
+  const config = latestSwitchTests()[channel];
+  return Boolean(config.enabled && config.test_mode === "relay_follow");
+}
+
 function syncPinSelect(select, config) {
   const options = pinOptions();
   const configuredPin = config.pin === null || config.pin === undefined || config.pin < 0 ? "" : String(config.pin);
@@ -171,17 +219,24 @@ function syncPinSelect(select, config) {
 function syncSwitchPanel(panel, config) {
   panel.querySelector('[data-switch-field="enabled"]').checked = Boolean(config.enabled);
   syncPinSelect(panel.querySelector('[data-switch-field="pin"]'), config);
+  panel.querySelector('[data-switch-field="test_mode"]').value = config.test_mode || "passive_read";
   panel.querySelector('[data-switch-field="mode"]').value = config.mode || "NO";
   panel.querySelector('[data-switch-field="pull_mode"]').value = config.pull_mode || "pullup";
   panel.querySelector('[data-switch-field="debounce_ms"]').value = config.debounce_ms ?? 30;
   panel.querySelector('[data-switch-field="settle_ms"]').value = config.settle_ms ?? 150;
+  panel.querySelector('[data-switch-field="observation_duration_s"]').value = config.observation_duration_s ?? 30;
+
+  panel.querySelectorAll("[data-mode-section]").forEach((el) => {
+    const sectionMode = el.dataset.modeSection;
+    el.classList.toggle("is-hidden", sectionMode !== (config.test_mode || "passive_read"));
+  });
 
   const current = config.current || {};
   const optionCount = pinOptions().length;
   const pinMapReadout = panel.querySelector('[data-switch-readout="pin-map"]');
   panel.querySelector('[data-switch-readout="current"]').textContent = `State: ${formatSwitchState(current)}`;
   panel.querySelector('[data-switch-readout="raw"]').textContent = `Raw: ${current.raw_state || "n/a"} (${current.raw ?? "-"})`;
-  panel.querySelector('[data-switch-readout="result"]').textContent = `Result: ${formatSwitchResult(config.last_test)}`;
+  panel.querySelector('[data-switch-readout="result"]').textContent = formatModeResult(config);
   pinMapReadout.textContent = optionCount > 0 ? `Pin map: ${optionCount} board options` : "Pin map: no board pin map received";
   pinMapReadout.classList.toggle("is-diagnostic", optionCount === 0);
   panel.classList.toggle("is-pass", Boolean(config.last_test?.available && config.last_test?.pass));
@@ -193,10 +248,12 @@ function collectSwitchConfig(panel) {
   return {
     enabled: panel.querySelector('[data-switch-field="enabled"]').checked,
     pin: pinValue === "" ? null : Number.parseInt(pinValue, 10),
+    test_mode: panel.querySelector('[data-switch-field="test_mode"]').value,
     mode: panel.querySelector('[data-switch-field="mode"]').value,
     pull_mode: panel.querySelector('[data-switch-field="pull_mode"]').value,
     debounce_ms: Math.max(0, Math.min(1000, Number.parseInt(panel.querySelector('[data-switch-field="debounce_ms"]').value, 10) || 0)),
     settle_ms: Math.max(0, Math.min(5000, Number.parseInt(panel.querySelector('[data-switch-field="settle_ms"]').value, 10) || 0)),
+    observation_duration_s: Math.max(1, Math.min(3600, Number.parseInt(panel.querySelector('[data-switch-field="observation_duration_s"]').value, 10) || 30)),
   };
 }
 
@@ -240,8 +297,12 @@ function render(snapshot) {
   document.querySelectorAll(".toggle").forEach((button) => {
     const key = button.dataset.output;
     const isOn = Boolean(outputs[key]);
+    const overridden = relayFollowOverridesOutput(key);
     button.classList.toggle("is-on", isOn);
-    button.querySelector("strong").textContent = isOn ? "ON" : "OFF";
+    button.classList.toggle("is-overridden", overridden);
+    button.disabled = overridden;
+    button.title = overridden ? "Relay follows switch state while follow mode is active" : "";
+    button.querySelector("strong").textContent = overridden ? "FOLLOW" : isOn ? "ON" : "OFF";
   });
 
   syncPwmControl(outputs);
@@ -300,6 +361,10 @@ function sendSwitchConfig(panel) {
 document.querySelectorAll(".toggle").forEach((button) => {
   button.addEventListener("click", () => {
     const key = button.dataset.output;
+    if (relayFollowOverridesOutput(key)) {
+      els.message.textContent = `${key} is controlled by relay-follow mode.`;
+      return;
+    }
     console.debug("[lv-test-plate] latest outputs before click", latestOutputs());
     send({ toggle: key }).catch((error) => {
       els.message.textContent = `Command failed: ${error.message}`;
@@ -325,6 +390,12 @@ els.switchPanels.forEach((panel) => {
       els.message.textContent = `Switch test failed: ${error.message}`;
     });
   });
+
+  panel.querySelector('[data-switch-action="observe"]').addEventListener("click", () => {
+    send({ observe_switch: panel.dataset.switchChannel }).catch((error) => {
+      els.message.textContent = `Switch observation failed: ${error.message}`;
+    });
+  });
 });
 
 els.pwmValue.addEventListener("input", () => {
@@ -346,12 +417,27 @@ els.pwmValue.addEventListener("change", () => {
 document.querySelector("#all-off").addEventListener("click", () => {
   pwmSync.pendingValue = 0;
   pwmSync.allowServerSync = true;
-  sendSetOutputs({
-    relay_1: false,
-    relay_2: false,
-    ssr_1: false,
-    pwm_enabled: false,
-    pwm_value: 0,
+  const switchTests = latestSwitchTests();
+  const followUpdates = {};
+  SWITCH_CHANNELS.forEach((channel) => {
+    if (switchTests[channel]?.enabled && switchTests[channel]?.test_mode === "relay_follow") {
+      followUpdates[channel] = { enabled: false };
+    }
+  });
+  const command = {
+    set_outputs: {
+      relay_1: false,
+      relay_2: false,
+      ssr_1: false,
+      pwm_enabled: false,
+      pwm_value: 0,
+    },
+  };
+  if (Object.keys(followUpdates).length > 0) {
+    command.switch_tests = followUpdates;
+  }
+  send(command).catch((error) => {
+    els.message.textContent = `Command failed: ${error.message}`;
   });
 });
 

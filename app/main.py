@@ -27,8 +27,10 @@ ASSET_VERSION = os.getenv("ASSET_VERSION", str(int(time.time())))
 SWITCH_CHANNELS = ("relay_1", "relay_2")
 SWITCH_MODES = {"NO", "NC"}
 SWITCH_PULL_MODES = {"pullup", "pulldown", "external"}
+SWITCH_TEST_MODES = {"passive_read", "relay_follow", "timed_observation", "output_feedback"}
 DEFAULT_SWITCH_DEBOUNCE_MS = 30
 DEFAULT_SWITCH_SETTLE_MS = 150
+DEFAULT_OBSERVATION_DURATION_S = 30
 
 
 @dataclass(frozen=True)
@@ -261,6 +263,24 @@ def _default_switch_result() -> dict[str, Any]:
     }
 
 
+def _default_switch_observation() -> dict[str, Any]:
+    return {
+        "active": False,
+        "available": False,
+        "status": "not_started",
+        "duration_s": DEFAULT_OBSERVATION_DURATION_S,
+        "started_at_ms": None,
+        "ended_at_ms": None,
+        "remaining_ms": 0,
+        "transition_count": 0,
+        "open_to_closed_count": 0,
+        "closed_to_open_count": 0,
+        "start": _default_switch_reading(),
+        "current": _default_switch_reading(),
+        "end": _default_switch_reading(),
+    }
+
+
 def _default_switch_tests() -> dict[str, dict[str, Any]]:
     return {
         channel: {
@@ -270,10 +290,16 @@ def _default_switch_tests() -> dict[str, dict[str, Any]]:
             "mode": "NO",
             "pull_mode": "pullup",
             "effective_pull_mode": "pullup",
+            "test_mode": "passive_read",
             "debounce_ms": DEFAULT_SWITCH_DEBOUNCE_MS,
             "settle_ms": DEFAULT_SWITCH_SETTLE_MS,
+            "observation_duration_s": DEFAULT_OBSERVATION_DURATION_S,
             "configured": False,
+            "relay_follow_enabled": False,
+            "commanded_by": "manual",
+            "status": "not_configured",
             "current": _default_switch_reading(),
+            "observation": _default_switch_observation(),
             "last_test": _default_switch_result(),
         }
         for channel in SWITCH_CHANNELS
@@ -286,6 +312,7 @@ def _default_capabilities() -> dict[str, Any]:
         "firmware_version": None,
         "supported_switch_modes": [],
         "supported_pull_modes": [],
+        "supported_switch_test_modes": [],
         "output_pins": {},
         "input_pins": {},
         "switch_input_pin_options": [],
@@ -320,15 +347,32 @@ def _coerce_switch_config(raw: dict[str, Any], existing: dict[str, Any] | None =
         pull_mode = str(raw.get("pull_mode", "")).lower()
         if pull_mode in SWITCH_PULL_MODES:
             coerced["pull_mode"] = pull_mode
+    if "test_mode" in raw:
+        test_mode = str(raw.get("test_mode", "")).lower()
+        if test_mode in SWITCH_TEST_MODES:
+            coerced["test_mode"] = test_mode
     if "effective_pull_mode" in raw:
         coerced["effective_pull_mode"] = str(raw.get("effective_pull_mode") or "")
     if "debounce_ms" in raw:
         coerced["debounce_ms"] = _coerce_int(raw["debounce_ms"], int(base.get("debounce_ms", DEFAULT_SWITCH_DEBOUNCE_MS)), 0, 1000)
     if "settle_ms" in raw:
         coerced["settle_ms"] = _coerce_int(raw["settle_ms"], int(base.get("settle_ms", DEFAULT_SWITCH_SETTLE_MS)), 0, 5000)
+    if "observation_duration_s" in raw:
+        coerced["observation_duration_s"] = _coerce_int(
+            raw["observation_duration_s"],
+            int(base.get("observation_duration_s", DEFAULT_OBSERVATION_DURATION_S)),
+            1,
+            3600,
+        )
     if "configured" in raw:
         coerced["configured"] = bool(raw["configured"])
-    for key in ("current", "last_test"):
+    if "relay_follow_enabled" in raw:
+        coerced["relay_follow_enabled"] = bool(raw["relay_follow_enabled"])
+    if "commanded_by" in raw:
+        coerced["commanded_by"] = str(raw.get("commanded_by") or "")
+    if "status" in raw:
+        coerced["status"] = str(raw.get("status") or "")
+    for key in ("current", "observation", "last_test"):
         if isinstance(raw.get(key), dict):
             coerced[key] = raw[key]
 
@@ -404,6 +448,8 @@ def _coerce_capabilities(raw: dict[str, Any], received_at: float) -> dict[str, A
         capabilities["supported_switch_modes"] = _coerce_capability_modes(raw["supported_switch_modes"], SWITCH_MODES)
     if isinstance(raw.get("supported_pull_modes"), list):
         capabilities["supported_pull_modes"] = _coerce_capability_modes(raw["supported_pull_modes"], SWITCH_PULL_MODES)
+    if isinstance(raw.get("supported_switch_test_modes"), list):
+        capabilities["supported_switch_test_modes"] = _coerce_capability_modes(raw["supported_switch_test_modes"], SWITCH_TEST_MODES)
     if isinstance(raw.get("output_pins"), dict):
         capabilities["output_pins"] = _coerce_pin_map(raw["output_pins"])
     if isinstance(raw.get("input_pins"), dict):
@@ -585,9 +631,11 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
     if mqtt_client is None or not mqtt_client.is_connected():
         raise HTTPException(status_code=503, detail="MQTT is not connected")
 
-    current_outputs = state.snapshot().get("outputs", {})
+    current_snapshot = state.snapshot()
+    current_outputs = current_snapshot.get("outputs", {})
     next_outputs = _coerce_outputs(current_outputs)
     output_command = False
+    modified_outputs: set[str] = set()
     switch_test_updates: dict[str, Any] | None = None
 
     toggle_key = command.get("toggle")
@@ -596,11 +644,16 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="Unsupported toggle output")
         next_outputs[toggle_key] = not bool(next_outputs.get(toggle_key, False))
         output_command = True
+        modified_outputs.add(toggle_key)
     elif isinstance(command.get("set_outputs"), dict):
-        next_outputs.update(_coerce_outputs(command["set_outputs"]))
+        normalized_outputs = _coerce_outputs(command["set_outputs"])
+        next_outputs.update(normalized_outputs)
+        modified_outputs.update(normalized_outputs)
         output_command = True
     elif isinstance(command.get("outputs"), dict):
-        next_outputs.update(_coerce_outputs(command["outputs"]))
+        normalized_outputs = _coerce_outputs(command["outputs"])
+        next_outputs.update(normalized_outputs)
+        modified_outputs.update(normalized_outputs)
         output_command = True
 
     if isinstance(command.get("switch_tests"), dict):
@@ -612,13 +665,28 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
 
     read_switch = command.get("read_switch")
     test_switch = command.get("test_switch")
+    observe_switch = command.get("observe_switch")
+    stop_observation = command.get("stop_observation")
     if read_switch is not None and read_switch not in SWITCH_CHANNELS:
         raise HTTPException(status_code=400, detail="Unsupported switch read channel")
     if test_switch is not None and test_switch not in SWITCH_CHANNELS:
         raise HTTPException(status_code=400, detail="Unsupported switch test channel")
+    if observe_switch is not None and observe_switch not in SWITCH_CHANNELS:
+        raise HTTPException(status_code=400, detail="Unsupported switch observation channel")
+    if stop_observation is not None and stop_observation not in SWITCH_CHANNELS:
+        raise HTTPException(status_code=400, detail="Unsupported switch observation channel")
 
-    if not output_command and not switch_test_updates and read_switch is None and test_switch is None:
-        raise HTTPException(status_code=400, detail="Command must include outputs, switch_tests, read_switch, or test_switch")
+    effective_switch_tests = json.loads(json.dumps(current_snapshot.get("switch_tests", _default_switch_tests())))
+    if switch_test_updates:
+        _merge_switch_tests(effective_switch_tests, switch_test_updates)
+
+    for relay in ("relay_1", "relay_2"):
+        config = effective_switch_tests.get(relay, {})
+        if relay in modified_outputs and config.get("enabled") and config.get("test_mode") == "relay_follow":
+            raise HTTPException(status_code=409, detail=f"{relay} is controlled by relay-follow mode")
+
+    if not output_command and not switch_test_updates and read_switch is None and test_switch is None and observe_switch is None and stop_observation is None:
+        raise HTTPException(status_code=400, detail="Command must include outputs, switch_tests, read_switch, test_switch, or observe_switch")
 
     payload = {
         "source": "web",
@@ -632,6 +700,10 @@ async def post_command(command: dict[str, Any]) -> dict[str, Any]:
         payload["read_switch"] = read_switch
     if test_switch is not None:
         payload["test_switch"] = test_switch
+    if observe_switch is not None:
+        payload["observe_switch"] = observe_switch
+    if stop_observation is not None:
+        payload["stop_observation"] = stop_observation
 
     info = mqtt_client.publish(settings.topics["cmd"], json.dumps(payload, separators=(",", ":")), qos=0, retain=False)
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
